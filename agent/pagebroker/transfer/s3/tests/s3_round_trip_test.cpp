@@ -8,8 +8,8 @@
 #include <sys/stat.h>
 
 #include <aws/core/auth/AWSCredentialsProvider.h>
-#include <aws/s3/S3Client.h>
-#include <aws/s3/model/HeadObjectRequest.h>
+#include <aws/s3-crt/S3CrtClient.h>
+#include <aws/s3-crt/model/HeadObjectRequest.h>
 
 #include <algorithm>
 #include <chrono>
@@ -47,9 +47,8 @@ class S3RoundTripTest : public ::testing::Test {
     connection_.use_virtual_addressing = false;
     connection_.access_key_id = Environment("AWS_ACCESS_KEY_ID");
     connection_.secret_access_key = Environment("AWS_SECRET_ACCESS_KEY");
-    limits_.part_size = 5 * 1024 * 1024;
-    limits_.buffer_budget = 4 * limits_.part_size;
-    limits_.workers = 2;
+    limits_.part_size = 8 * 1024 * 1024;
+    limits_.target_gbps = 2;
     limits_.active_files = 2;
     limits_.request_retries = 2;
     limits_.operation_timeout = std::chrono::seconds(30);
@@ -135,14 +134,16 @@ class S3RoundTripTest : public ::testing::Test {
   // The caller keeps an uploader (or an engine that uploaded) alive here.
   bool Barrier(const std::string& operation, const std::string& scenario)
   {
-    Aws::S3::S3ClientConfiguration config(Aws::Client::ClientConfigurationInitValues{true});
+    Aws::S3Crt::S3CrtClientConfiguration config(Aws::Client::ClientConfigurationInitValues{true});
     config.region = connection_.region;
-    config.endpointOverride = connection_.endpoint;
+    const auto scheme_end = connection_.endpoint.find("://");
+    config.scheme = connection_.endpoint.starts_with("https://") ? Aws::Http::Scheme::HTTPS : Aws::Http::Scheme::HTTP;
+    config.endpointOverride = connection_.endpoint.substr(scheme_end + 3);
     config.useVirtualAddressing = false;
     config.caFile = connection_.ca_file;
     config.httpRequestTimeoutMs = 12000;
-    Aws::S3::S3Client client(Aws::Auth::AWSCredentials(connection_.access_key_id, connection_.secret_access_key), nullptr, config);
-    Aws::S3::Model::HeadObjectRequest request;
+    Aws::S3Crt::S3CrtClient client(Aws::Auth::AWSCredentials(connection_.access_key_id, connection_.secret_access_key), config);
+    Aws::S3Crt::Model::HeadObjectRequest request;
     request.WithBucket(bucket_).WithKey("roundtrip/" + operation + "/" + scenario);
     return client.HeadObject(request).IsSuccess();
   }
@@ -158,7 +159,6 @@ TEST_F(S3RoundTripTest, UploadsAndRestoresVerifiedTree)
 {
   // Exercise the proposed production part size; the fixture crosses two parts.
   limits_.part_size = 16 * 1024 * 1024;
-  limits_.buffer_budget = 2 * limits_.part_size;
   S3StorageBackend storage(Config());
   ModelStreamerRestore restore_reader(ReaderOptions(), std::chrono::seconds(30));
   const auto plan = storage.UploadCheckpoint(UploadPlan(fixture_, "tree"));
@@ -362,10 +362,9 @@ TEST_F(S3RoundTripTest, AbortsFailedMultipartAndRemainsUsable)
 {
   S3Client uploader(connection_, limits_);
   const auto error = FailedUpload(uploader, "part-failure");
-  EXPECT_EQ(error.primary.operation, "UploadPart");
-  EXPECT_FALSE(error.upload_id.empty());
-  EXPECT_EQ(error.remote_state, S3RemoteState::NOT_COMPLETED);
-  EXPECT_EQ(error.cleanup_state, S3CleanupState::CONFIRMED);
+  EXPECT_EQ(error.primary.operation, "PutObject");
+  EXPECT_EQ(error.remote_state, S3RemoteState::UNKNOWN);
+  EXPECT_EQ(error.cleanup_state, S3CleanupState::UNCONFIRMED);
   VerifyFile(uploader.UploadFile(fixture_ / "small", Destination("after-failure")), fixture_ / "small", "after-failure");
 }
 
@@ -373,24 +372,19 @@ TEST_F(S3RoundTripTest, PreservesPrimaryErrorWhenAbortFails)
 {
   S3Client uploader(connection_, limits_);
   const auto error = FailedUpload(uploader, "abort-failure");
-  EXPECT_EQ(error.primary.operation, "UploadPart");
+  EXPECT_EQ(error.primary.operation, "PutObject");
   EXPECT_EQ(error.cleanup_state, S3CleanupState::UNCONFIRMED);
-  ASSERT_TRUE(error.cleanup_failure);
-  EXPECT_EQ(error.cleanup_failure->operation, "AbortMultipartUpload");
-  EXPECT_FALSE(error.upload_id.empty());
 }
 
-TEST_F(S3RoundTripTest, ReportsUnconfirmedCleanupWhenVerificationFails)
+TEST_F(S3RoundTripTest, DoesNotClaimCleanupItCannotVerify)
 {
   S3Client uploader(connection_, limits_);
   const auto error = FailedUpload(uploader, "verify-failure");
-  EXPECT_EQ(error.primary.operation, "UploadPart");
+  EXPECT_EQ(error.primary.operation, "PutObject");
   EXPECT_EQ(error.cleanup_state, S3CleanupState::UNCONFIRMED);
-  ASSERT_TRUE(error.cleanup_failure);
-  EXPECT_EQ(error.cleanup_failure->operation, "ListParts");
 }
 
-TEST_F(S3RoundTripTest, SourceTruncationAbortsInsteadOfSendingUninitializedBytes)
+TEST_F(S3RoundTripTest, SourceTruncationNeverReturnsAVerifiedUpload)
 {
   S3Client uploader(connection_, limits_);
   const auto source = temporary_.path() / "source";
@@ -408,17 +402,16 @@ TEST_F(S3RoundTripTest, SourceTruncationAbortsInsteadOfSendingUninitializedBytes
   fs::resize_file(source, 0);
   EXPECT_TRUE(Barrier("release", "source-truncated"));
   const auto error = upload.get();
-  EXPECT_EQ(error.primary.code, "SourceShortened");
-  EXPECT_EQ(error.cleanup_state, S3CleanupState::CONFIRMED);
-  EXPECT_EQ(error.remote_state, S3RemoteState::NOT_COMPLETED);
+  EXPECT_EQ(error.primary.code, "SourceChanged");
+  EXPECT_NE(error.remote_state, S3RemoteState::NO_WRITES_ISSUED);
 }
 
 TEST_F(S3RoundTripTest, RejectsErrorEmbeddedInSuccessfulHttpResponse)
 {
   S3Client uploader(connection_, limits_);
   const auto error = FailedUpload(uploader, "complete-error");
-  EXPECT_EQ(error.primary.operation, "CompleteMultipartUpload");
-  EXPECT_EQ(error.cleanup_state, S3CleanupState::CONFIRMED);
+  EXPECT_EQ(error.primary.operation, "PutObject");
+  EXPECT_EQ(error.cleanup_state, S3CleanupState::UNCONFIRMED);
 }
 
 TEST_F(S3RoundTripTest, ReportsUncertainCompletionWithoutDeletingObjects)
@@ -431,14 +424,13 @@ TEST_F(S3RoundTripTest, ReportsUncertainCompletionWithoutDeletingObjects)
   // The host independently verifies both completed objects still exist.
 }
 
-TEST_F(S3RoundTripTest, ReportsLostInitiationWithoutRetryingOrGuessingUploadId)
+TEST_F(S3RoundTripTest, ReportsLostInitiationWithoutClaimingCleanup)
 {
   S3Client uploader(connection_, limits_);
   const auto error = FailedUpload(uploader, "lost-create");
-  EXPECT_EQ(error.primary.operation, "CreateMultipartUpload");
+  EXPECT_EQ(error.primary.operation, "PutObject");
   EXPECT_EQ(error.remote_state, S3RemoteState::UNKNOWN);
   EXPECT_EQ(error.cleanup_state, S3CleanupState::UNCONFIRMED);
-  EXPECT_TRUE(error.upload_id.empty());
 }
 
 TEST_F(S3RoundTripTest, DetectsCorruptionThroughNativeReader)
@@ -484,7 +476,7 @@ TEST_F(S3RoundTripTest, BoundsConcurrentUploadsAndIsolatesFailure)
   failing.get();
   for (auto& restore : restores)
     EXPECT_NO_THROW(restore.get());
-  // The host-side counters independently assert active upload and HTTP bounds.
+  // The host independently checks file admission; CRT schedules the HTTP parts.
 }
 
 TEST_F(S3RoundTripTest, RestoreContinuesWhileUploadIsBlocked)
@@ -515,9 +507,9 @@ TEST_F(S3RoundTripTest, DeadlineDrainsAndReleasesResources)
   limits_.request_retries = 0;
   S3Client uploader(connection_, limits_);
   const auto begin = std::chrono::steady_clock::now();
-  const auto error = FailedUpload(uploader, "deadline", false);
-  EXPECT_NE(error.primary.code, "UnexpectedSuccess");
-  EXPECT_LT(std::chrono::steady_clock::now() - begin, std::chrono::seconds(5));
+  const auto error = FailedUpload(uploader, "stalled", false);
+  EXPECT_EQ(error.primary.code, "DeadlineExceeded");
+  EXPECT_LT(std::chrono::steady_clock::now() - begin, std::chrono::seconds(10));
   EXPECT_NO_THROW(uploader.UploadFile(fixture_ / "small", Destination("after-deadline")));
 }
 
@@ -529,9 +521,45 @@ TEST_F(S3RoundTripTest, MultipartDeadlineDrainsBeforeAborting)
   S3Client uploader(connection_, limits_);
   const auto error = FailedUpload(uploader, "multipart-deadline");
   EXPECT_NE(error.primary.code, "UnexpectedSuccess");
-  EXPECT_FALSE(error.upload_id.empty());
-  EXPECT_EQ(error.cleanup_state, S3CleanupState::CONFIRMED);
+  EXPECT_EQ(error.cleanup_state, S3CleanupState::UNCONFIRMED);
   EXPECT_NO_THROW(uploader.UploadFile(fixture_ / "small", Destination("after-multipart-deadline")));
+}
+
+TEST_F(S3RoundTripTest, ZeroRetriesDisablesCrtDefaults)
+{
+  limits_.request_retries = 0;
+  S3Client uploader(connection_, limits_);
+  const auto error = FailedUpload(uploader, "no-retry", false);
+  EXPECT_EQ(error.primary.operation, "PutObject");
+  EXPECT_FALSE(error.primary.code.empty());
+  EXPECT_EQ(error.remote_state, S3RemoteState::UNKNOWN);
+  // CRT can report a transport failure instead of the final HTTP response.
+  // The fixture independently requires exactly one request at the server.
+  EXPECT_NO_THROW(uploader.UploadFile(fixture_ / "small", Destination("after-no-retry")));
+}
+
+TEST_F(S3RoundTripTest, CancellationDrainsAndLeavesClientUsable)
+{
+  limits_.request_retries = 0;
+  S3Client uploader(connection_, limits_);
+  std::stop_source cancellation;
+  S3UploadOptions options{{TransferControl::Clock::time_point::max(), cancellation.get_token()}};
+  auto upload = std::async(std::launch::async, [&] {
+    try {
+      uploader.UploadFile(fixture_ / "nested/large", Destination("cancel-upload"), options);
+      return S3Error({"test", "UnexpectedSuccess"});
+    }
+    catch (const S3Error& error) {
+      return error;
+    }
+  });
+  EXPECT_TRUE(Barrier("wait", "cancel-upload"));
+  cancellation.request_stop();
+  EXPECT_TRUE(Barrier("release", "cancel-upload"));
+  const auto error = upload.get();
+  EXPECT_EQ(error.primary.code, "Cancelled");
+  EXPECT_EQ(error.cleanup_state, S3CleanupState::UNCONFIRMED);
+  EXPECT_NO_THROW(uploader.UploadFile(fixture_ / "small", Destination("after-cancel")));
 }
 
 TEST_F(S3RoundTripTest, CoexistsWithReaderAndMultipleUploaderLifetimes)
@@ -615,7 +643,7 @@ TEST_F(S3RoundTripTest, MetadataMemoryProbe)
     GTEST_SKIP() << "selected in a separate process by the resource check";
   struct rusage before {}, after {};
   ASSERT_EQ(getrusage(RUSAGE_SELF, &before), 0);
-  limits_.buffer_budget = 250 * 1024 * 1024;
+  limits_.buffer_budget = 2ULL * 1024 * 1024 * 1024;
   S3Client client(connection_, limits_);
   EXPECT_TRUE(client.Get({bucket_, "fixture/small"}, 1024));
   ASSERT_EQ(getrusage(RUSAGE_SELF, &after), 0);

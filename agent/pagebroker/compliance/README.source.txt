@@ -15,7 +15,7 @@ Upstream source for the third-party components redistributed in this image.
 This image also ships the pinned Model Streamer core and S3 native libraries,
 with their wheel licenses and metadata in /legal/model-streamer/ and
 /legal/model-streamer-s3/. OpenSSL libcrypto provides SHA-256; its attribution
-is in /legal/openssl/copyright. The uploader uses AWS SDK for C++ 1.11.584,
+is in /legal/openssl/copyright. The uploader uses the S3 CRT client from AWS SDK for C++ 1.11.584,
 source commit bba3cfc14d4fc148aeee7a8ff7822dd7a9a0f4d3:
 
   https://github.com/aws/aws-sdk-cpp/tree/bba3cfc14d4fc148aeee7a8ff7822dd7a9a0f4d3
