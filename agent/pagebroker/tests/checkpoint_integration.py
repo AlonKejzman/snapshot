@@ -96,7 +96,8 @@ class CheckpointService:
         uid = self.labels.get(checkpoint_id, checkpoint_id)
         method = environment["REQUEST_METHOD"]
         query = parse_qs(environment.get("QUERY_STRING", ""), keep_blank_values=True)
-        native = "aws-sdk-cpp" in environment.get("HTTP_USER_AGENT", "")
+        # CRT handles GET/PUT itself; metadata HEAD still uses the SDK client.
+        native = environment.get("HTTP_USER_AGENT", "").startswith(("aws-sdk-cpp/", "CRTS3NativeClient/"))
         with self.changed:
             self.counts[uid, method] += 1
             auth = environment.get("HTTP_AUTHORIZATION", "")
