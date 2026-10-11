@@ -60,6 +60,16 @@ TEST_F(ModelStreamerConfigTest, OmissionPreservesLibraryAndLegacyDaemonDefaults)
   EXPECT_FALSE(env.contains("RUNAI_STREAMER_FS_QUEUE_DEPTH"));
 }
 
+TEST_F(ModelStreamerConfigTest, UploadTuningDoesNotChangeReaderMemoryOrConnections)
+{
+  S3Config storage;
+  storage.transfer.upload_limits.buffer_budget = 2ULL * 1024 * 1024 * 1024;
+  storage.transfer.upload_limits.target_gbps = 25;
+  const auto options = ResolveModelStreamerOptions({}, &storage);
+  EXPECT_EQ(options.s3_max_inflight_mib, 128);
+  EXPECT_EQ(options.s3_max_connections, 4);
+}
+
 TEST_F(ModelStreamerConfigTest, ResolvesJsonBeforeEnvironmentBeforeUploadFallback)
 {
   setenv("RUNAI_STREAMER_S3_MAX_CONNECTIONS", "invalid-but-overridden", 1);
@@ -77,8 +87,8 @@ TEST_F(ModelStreamerConfigTest, ResolvesJsonBeforeEnvironmentBeforeUploadFallbac
   EXPECT_EQ(options.s3_max_retries, 0);
   EXPECT_EQ(options.s3_concurrency, 3);
   EXPECT_EQ(options.filesystem_queue_depth, "64,nfs=16");
-  EXPECT_EQ(storage.transfer.upload_limits.workers, 4);
-  EXPECT_EQ(storage.transfer.upload_limits.buffer_budget, 128 * 1024 * 1024);
+  EXPECT_EQ(storage.transfer.upload_limits.target_gbps, 10);
+  EXPECT_EQ(storage.transfer.upload_limits.buffer_budget, 1024ULL * 1024 * 1024);
   EXPECT_EQ(std::string(std::getenv("RUNAI_STREAMER_S3_MAX_CONNECTIONS")), "invalid-but-overridden");
   ConfigureModelStreamerEnvironment(options, &storage);
   EXPECT_NO_THROW(options.ValidateEnvironment());

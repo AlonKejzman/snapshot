@@ -93,8 +93,8 @@ When S3 storage is configured, omitted reader settings retain these fallbacks:
 
 | Reader field | Existing PageBroker fallback |
 | --- | --- |
-| `maxConnections` | `limits.uploadWorkers` |
-| `maxInflightMiB` | `limits.uploadBufferBytes / 1048576` |
+| `maxConnections` | 4, independent of upload throughput target |
+| `maxInflightMiB` | 128, independent of CRT upload memory budget |
 | `readChunkBytes` | Smaller of 16 MiB and `limits.uploadPartBytes` |
 | `lowSpeedTimeoutMs` | `limits.requestSeconds * 1000` |
 | `maxRetries` | 3 |
