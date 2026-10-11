@@ -11,6 +11,7 @@
 #include <aws/io/io.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
+#include <aws/core/client/DefaultRetryStrategy.h>
 #include <aws/core/config/ConfigAndCredentialsCacheManager.h>
 #include <aws/s3-crt/S3CrtClient.h>
 #include <aws/s3-crt/model/GetObjectRequest.h>
@@ -327,6 +328,10 @@ ClientConfiguration(const S3Connection& connection, const S3Limits& limits)
   config.memoryLimitBytes = limits.buffer_budget;
   config.throughputTargetGbps = limits.target_gbps;
   config.connectTimeoutMs = limits.connect_timeout.count();
+  // HeadObject uses the SDK HTTP client, while GET/PUT use CRT. Bound both
+  // retry paths so metadata failures honor the same per-request policy.
+  config.retryStrategy = std::make_shared<Aws::Client::DefaultRetryStrategy>(limits.request_retries);
+  config.httpRequestTimeoutMs = limits.request_timeout.count();
   // Like Model Streamer, requestTimeoutMs is a low-speed interval, not a
   // total operation deadline. CRT imposes a minimum three-second interval.
   config.requestTimeoutMs = limits.request_timeout.count();
