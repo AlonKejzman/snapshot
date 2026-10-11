@@ -175,8 +175,8 @@ def run(args):
             config = dict(storeId="test-store", endpoint=environment["AWS_ENDPOINT_URL"], region="us-east-1", bucket=service.bucket,
                           prefix=service.prefix, addressing="path", allowHttp=not args.tls,
                           caFile=environment.get("AWS_CA_BUNDLE", ""),
-                          limits=dict(transactionSeconds=120, activeTransactions=8, uploadPartBytes=5*1024*1024,
-                                      uploadBufferBytes=20*1024*1024, requestSeconds=2,
+                          limits=dict(transactionSeconds=120, activeTransactions=8, uploadPartBytes=8*1024*1024,
+                                      uploadBufferBytes=1024*1024*1024, requestSeconds=2,
                                       uploadConnectSeconds=1, uploadRequestRetries=2))
             config_path = root / "storage.json"
             config_path.write_text(json.dumps(config))

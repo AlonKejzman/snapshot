@@ -8,23 +8,21 @@
 #include <unistd.h>
 
 #include <aws/core/Aws.h>
+#include <aws/io/io.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
-#include <aws/core/client/DefaultRetryStrategy.h>
-#include <aws/core/utils/stream/PreallocatedStreamBuf.h>
-#include <aws/core/utils/threading/PooledThreadExecutor.h>
-#include <aws/s3/S3Client.h>
-#include <aws/s3/model/AbortMultipartUploadRequest.h>
-#include <aws/s3/model/CompleteMultipartUploadRequest.h>
-#include <aws/s3/model/CreateMultipartUploadRequest.h>
-#include <aws/s3/model/GetObjectRequest.h>
-#include <aws/s3/model/HeadObjectRequest.h>
-#include <aws/s3/model/ListPartsRequest.h>
-#include <aws/s3/model/PutObjectRequest.h>
-#include <aws/s3/model/UploadPartRequest.h>
+#include <aws/core/config/ConfigAndCredentialsCacheManager.h>
+#include <aws/s3-crt/S3CrtClient.h>
+#include <aws/s3-crt/model/GetObjectRequest.h>
+#include <aws/s3-crt/model/HeadObjectRequest.h>
+#include <aws/s3-crt/model/PutObjectRequest.h>
 
 #include <algorithm>
-#include <atomic>
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <future>
 #include <cerrno>
 #include <condition_variable>
 #include <exception>
@@ -121,17 +119,19 @@ HasSupportedEndpoint(const std::string& endpoint)
 bool
 HasValidResourceLimits(const S3Limits& limits)
 {
-  if (limits.part_size < 5 * kMiB || limits.part_size > 5 * 1024 * kMiB)
+  if (limits.part_size < 8 * kMiB || limits.part_size > 5 * 1024 * kMiB)
     return false;
-  if (limits.buffer_budget < limits.part_size || limits.buffer_budget % limits.part_size != 0)
+  if (limits.buffer_budget < 1024 * kMiB)
+    return false;
+  if (limits.buffer_budget < 2 * limits.part_size)
     return false;
   if (limits.buffer_budget > std::numeric_limits<std::size_t>::max())
     return false;
-  if (limits.workers == 0 || limits.active_files == 0)
+  if (limits.active_files == 0)
     return false;
   if (limits.request_retries > 10)
     return false;
-  return limits.cleanup_rounds > 0 && limits.cleanup_rounds <= 10;
+  return std::isfinite(limits.target_gbps) && limits.target_gbps > 0 && limits.target_gbps <= 1000;
 }
 
 bool
@@ -148,23 +148,6 @@ FitsMultipartLimits(std::uint64_t size, std::uint64_t part_size)
   if (size > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()))
     return false;
   return size / part_size + (size % part_size != 0) <= 10'000;
-}
-
-bool
-IsMultipartCleanupComplete(const Aws::S3::Model::ListPartsOutcome& outcome)
-{
-  if (!outcome.IsSuccess())
-    return outcome.GetError().GetErrorType() == Aws::S3::S3Errors::NO_SUCH_UPLOAD;
-  return outcome.GetResult().GetParts().empty() && !outcome.GetResult().GetIsTruncated();
-}
-
-bool
-HasUntrackedMultipartUpload(S3RemoteState state, const std::string& upload_id,
-    std::uint64_t size, const S3Limits& limits)
-{
-  if (state != S3RemoteState::UNKNOWN)
-    return false;
-  return upload_id.empty() && size > limits.part_size;
 }
 
 bool
@@ -188,56 +171,22 @@ struct Operation {
 
   bool Continue() const noexcept
   {
-    return !cancelled.load() && !cancellation.stop_requested() && Clock::now() < deadline;
+    return !cancellation.stop_requested() && Clock::now() < deadline;
   }
 
   void Check() const
   {
     if (Clock::now() >= deadline)
       throw S3Error({"upload", "DeadlineExceeded"});
-    if (cancelled.load() || cancellation.stop_requested())
+    if (cancellation.stop_requested())
       throw S3Error({"upload", "Cancelled"});
-  }
-
-  void Fail(std::exception_ptr error) noexcept
-  {
-    std::lock_guard lock(mutex);
-    if (!failure)
-      failure = error;
-    cancelled = true;
-  }
-
-  void Finish() noexcept
-  {
-    std::lock_guard lock(mutex);
-    --pending;
-    changed.notify_all();
-  }
-
-  void Drain()
-  {
-    std::unique_lock lock(mutex);
-    if (!changed.wait_until(lock, deadline, [&] { return pending == 0; })) {
-      if (!failure)
-        failure = std::make_exception_ptr(S3Error({"upload", "DeadlineExceeded"}));
-      cancelled = true;
-      // A timeout never permits freeing request bodies still used by the SDK.
-      changed.wait(lock, [&] { return pending == 0; });
-    }
-    if (failure)
-      std::rethrow_exception(failure);
   }
 
   const Clock::time_point deadline;
   const std::stop_token cancellation;
-  std::atomic<bool> cancelled = false;
-  std::mutex mutex;
-  std::condition_variable changed;
-  std::size_t pending = 0;
-  std::exception_ptr failure;
 };
 
-// A lease bounds admission, HTTP requests, or a preallocated upload buffer.
+// A lease bounds admitted file transfers and metadata operations, not CRT parts.
 class Slots {
  public:
   struct Lease {
@@ -285,8 +234,10 @@ RequestFailure(const char* operation, const Error& error)
 {
   // SDK/server messages can echo caller inputs; retain structured diagnostics
   // instead of logging response bodies, authorization headers, or credentials.
-  return {operation, error.GetExceptionName().c_str(), static_cast<int>(error.GetResponseCode()),
-          error.GetRequestId().c_str()};
+  std::string code = error.GetExceptionName().c_str();
+  if (code.empty())
+    code = "SDKError(" + std::to_string(static_cast<int>(error.GetErrorType())) + ")";
+  return {operation, std::move(code), static_cast<int>(error.GetResponseCode()), error.GetRequestId().c_str()};
 }
 
 [[noreturn]] void
@@ -300,24 +251,6 @@ RethrowUploadError(std::exception_ptr failure)
   }
   catch (...) {
     std::throw_with_nested(S3Error({"upload", "LocalFailure"}));
-  }
-}
-
-void
-ReadPart(int descriptor, unsigned char* buffer, std::size_t size, off_t offset, const Operation& operation)
-{
-  std::size_t read = 0;
-  while (read < size) {
-    operation.Check();
-    const auto count = pread(descriptor, buffer + read, size - read, offset + read);
-    if (count < 0) {
-      if (errno == EINTR)
-        continue;
-      throw std::system_error(errno, std::generic_category(), "read S3 upload source");
-    }
-    if (count == 0)
-      throw S3Error({"read source", "SourceShortened"});
-    read += count;
   }
 }
 
@@ -346,6 +279,84 @@ CheckSource(int descriptor, const struct stat& original)
   if (!SourceUnchanged(current, original))
     throw S3Error({"read source", "SourceChanged"});
 }
+// Adapted from runai-model-streamer cpp/s3/client/client.cc (ae93548):
+// keep the endpoint scheme separate, and use the same AWS credential constructors.
+bool
+StartsWithCaseInsensitive(const Aws::String& value, const Aws::String& prefix)
+{
+  if (value.size() < prefix.size())
+    return false;
+  for (std::size_t i = 0; i < prefix.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(value[i])) !=
+        std::tolower(static_cast<unsigned char>(prefix[i])))
+      return false;
+  }
+  return true;
+}
+
+Aws::S3Crt::S3CrtClientConfiguration
+ClientConfiguration(const S3Connection& connection, const S3Limits& limits)
+{
+  Aws::S3Crt::S3CrtClientConfiguration config(Aws::Client::ClientConfigurationInitValues{
+      !connection.region.empty() && !connection.access_key_id.empty()});
+  if (!connection.region.empty())
+    config.region = connection.region;
+  config.endpointOverride = connection.endpoint;
+  for (const auto& prefix : {Aws::String("https://"), Aws::String("http://")}) {
+    if (StartsWithCaseInsensitive(config.endpointOverride, prefix)) {
+      config.endpointOverride.erase(0, prefix.size());
+      config.scheme = prefix == "https://" ? Aws::Http::Scheme::HTTPS : Aws::Http::Scheme::HTTP;
+      if (config.endpointOverride.empty() || config.endpointOverride.front() == ':')
+        throw std::invalid_argument("S3 endpoint has no host");
+      break;
+    }
+  }
+  config.useVirtualAddressing = connection.use_virtual_addressing;
+  config.caFile = connection.ca_file;
+  if (config.caFile.empty()) {
+    if (const auto* ca = std::getenv("AWS_CA_BUNDLE"))
+      config.caFile = ca;
+    else
+      config.caFile = Aws::Config::GetCachedConfigValue(Aws::Auth::GetConfigProfileName(), "ca_bundle");
+  }
+  if (!config.caFile.empty() && !std::filesystem::is_regular_file(config.caFile))
+    throw std::invalid_argument("S3 CA certificate file does not exist");
+  config.verifySSL = true;
+  config.partSize = limits.part_size;
+  config.multipartUploadThreshold = limits.part_size;
+  config.memoryLimitBytes = limits.buffer_budget;
+  config.throughputTargetGbps = limits.target_gbps;
+  config.connectTimeoutMs = limits.connect_timeout.count();
+  // Like Model Streamer, requestTimeoutMs is a low-speed interval, not a
+  // total operation deadline. CRT imposes a minimum three-second interval.
+  config.requestTimeoutMs = limits.request_timeout.count();
+  config.lowSpeedLimit = 1;
+  using Retry = Aws::S3Crt::S3CrtClientConfiguration::CrtRetryStrategyConfig::CrtRetryStrategyType;
+  config.crtRetryStrategyConfig.crtRetryStrategyType = Retry::EXPONENTIAL_BACKOFF;
+  config.crtRetryStrategyConfig.config.maxRetries = std::max(1U, limits.request_retries);
+  if (limits.request_retries == 0) {
+    config.crtConfigFactories.retryStrategyCreateFn = [](const auto& settings) {
+      auto* strategy = Aws::S3Crt::S3CrtClientConfiguration::S3CrtConfigFactories::defaultFactories.retryStrategyCreateFn(settings);
+      if (!strategy)
+        throw std::runtime_error("cannot create S3 retry strategy");
+      // The pinned CRT's NO_RETRY denies the initial token too, so no request
+      // reaches S3. Retain CRT's asynchronous admission and token lifetime,
+      // overriding only the public retry hook to refuse subsequent attempts.
+      static auto no_retries = [strategy] {
+        auto callbacks = *strategy->vtable;
+        callbacks.schedule_retry = [](aws_retry_token*, aws_retry_error_type,
+                                      aws_retry_strategy_on_retry_ready_fn*, void*) {
+          return aws_raise_error(AWS_IO_MAX_RETRIES_EXCEEDED);
+        };
+        return callbacks;
+      }();
+      strategy->vtable = &no_retries;
+      return strategy;
+    };
+  }
+  return config;
+}
+
 }  // namespace
 
 S3Connection
@@ -412,55 +423,14 @@ S3Error::S3Error(S3RequestFailure failure)
 
 struct S3Client::Impl {
   Impl(const S3Connection& connection, S3Limits limits)
-      : connection(connection), limits(limits), files(limits.active_files), requests(limits.workers),
-        buffer_slots(limits.buffer_budget / limits.part_size)
+      : limits(limits), files(limits.active_files)
   {
-    executor = std::make_shared<Aws::Utils::Threading::PooledThreadExecutor>(limits.workers);
-    // Explicit region and credentials need no metadata discovery, including
-    // during configuration construction before we assign the region below.
-    Aws::S3::S3ClientConfiguration config(Aws::Client::ClientConfigurationInitValues{
-        !connection.region.empty() && !connection.access_key_id.empty()});
-    if (!connection.region.empty())
-      config.region = connection.region;
-    config.endpointOverride = connection.endpoint;
-    config.useVirtualAddressing = connection.use_virtual_addressing;
-    config.caFile = connection.ca_file;
-    config.verifySSL = true;
-    config.maxConnections = limits.workers;
-    config.connectTimeoutMs = limits.connect_timeout.count();
-    config.httpRequestTimeoutMs = limits.request_timeout.count();
-    config.requestTimeoutMs = limits.request_timeout.count();
-    config.executor = executor;
-    config.retryStrategy = std::make_shared<Aws::Client::DefaultRetryStrategy>(limits.request_retries);
-    auto make_client = [&] {
-      if (connection.access_key_id.empty())
-        return std::make_unique<Aws::S3::S3Client>(config);
-      return std::make_unique<Aws::S3::S3Client>(
-          Aws::Auth::AWSCredentials(connection.access_key_id, connection.secret_access_key, connection.session_token), nullptr, config);
-    };
-    client = make_client();
-    // Retrying initiation after a lost response can create an upload whose ID
-    // we never learn. Do not retry this non-idempotent operation automatically.
-    config.retryStrategy = std::make_shared<Aws::Client::DefaultRetryStrategy>(0);
-    initiation_client = make_client();
-  }
-
-  ~Impl()
-  {
-    executor->WaitUntilStopped();
-  }
-
-  void AllocateBuffers(const Operation& operation)
-  {
-    std::call_once(buffers_once, [&] {
-      std::vector<std::vector<unsigned char>> allocated;
-      for (std::uint64_t i = 0; i < limits.buffer_budget / limits.part_size; ++i) {
-        operation.Check();
-        allocated.emplace_back(limits.part_size);
-      }
-      buffers = std::move(allocated);
-    });
-    operation.Check();
+    const auto config = ClientConfiguration(connection, limits);
+    if (connection.access_key_id.empty())
+      client = std::make_unique<Aws::S3Crt::S3CrtClient>(config);
+    else
+      client = std::make_unique<Aws::S3Crt::S3CrtClient>(
+          Aws::Auth::AWSCredentials(connection.access_key_id, connection.secret_access_key, connection.session_token), config);
   }
 
   template<class Request, class Call>
@@ -476,146 +446,27 @@ struct S3Client::Impl {
   template<class Request, class Call>
   auto RequestResult(Request& request, const std::shared_ptr<Operation>& operation, Call call)
   {
-    auto slot = requests.Acquire(*operation);
+    auto slot = files.Acquire(*operation);
     operation->Check();
     request.SetContinueRequestHandler([operation](const Aws::Http::HttpRequest*) { return operation->Continue(); });
-    return call(request);
+    auto outcome = call(request);
+    operation->Check();
+    return outcome;
   }
 
-  template<class Request, class Call>
-  void SendBody(Request& request, const std::shared_ptr<Operation>& operation,
-                unsigned char* bytes, std::size_t size, const char* name, Call call)
+  Aws::S3Crt::Model::PutObjectOutcome Upload(Aws::S3Crt::Model::PutObjectRequest& request,
+                                           const std::shared_ptr<Operation>& operation)
   {
-    Aws::Utils::Stream::PreallocatedStreamBuf stream_buffer(bytes, size);
-    auto body = Aws::MakeShared<Aws::IOStream>(kAllocationTag, &stream_buffer);
-    request.SetBody(body);
-    request.SetContentLength(size);
-    request.SetContentType("application/octet-stream");
-    // The synchronous SDK call (including retry rewinds) finishes before either
-    // the stream buffer or the leased bytes can be released.
-    const auto outcome = RequestResult(request, operation, call);
-    request.SetBody(nullptr);
-    if (!outcome.IsSuccess())
-      throw S3Error(RequestFailure(name, outcome.GetError()));
-  }
-
-  void Cleanup(S3Error& error) noexcept
-  {
-    if (error.upload_id.empty() || error.remote_state == S3RemoteState::COMPLETED)
-      return;
-    error.cleanup_state = S3CleanupState::UNCONFIRMED;
-    try {
-      auto cleanup = std::make_shared<Operation>(std::min(limits.operation_timeout, limits.request_timeout * (2 * limits.cleanup_rounds + 1)));
-      for (unsigned round = 0; round < limits.cleanup_rounds; ++round) {
-        Aws::S3::Model::AbortMultipartUploadRequest abort;
-        abort.WithBucket(error.destination.bucket).WithKey(error.destination.key).WithUploadId(error.upload_id);
-        auto aborted = RequestResult(abort, cleanup, [&](const auto& request) { return client->AbortMultipartUpload(request); });
-        if (!aborted.IsSuccess() && aborted.GetError().GetErrorType() != Aws::S3::S3Errors::NO_SUCH_UPLOAD) {
-          error.cleanup_failure = RequestFailure("AbortMultipartUpload", aborted.GetError());
-          continue;
-        }
-        Aws::S3::Model::ListPartsRequest list;
-        list.WithBucket(error.destination.bucket).WithKey(error.destination.key).WithUploadId(error.upload_id).WithMaxParts(1);
-        auto listed = RequestResult(list, cleanup, [&](const auto& request) { return client->ListParts(request); });
-        if (IsMultipartCleanupComplete(listed)) {
-          error.cleanup_state = S3CleanupState::CONFIRMED;
-          error.cleanup_failure.reset();
-          return;
-        }
-        error.cleanup_failure = listed.IsSuccess() ? S3RequestFailure{"ListParts", "PartsRemain"} :
-                                                    RequestFailure("ListParts", listed.GetError());
-      }
-    }
-    catch (const S3Error& failure) {
-      try {
-        error.cleanup_failure = failure.primary;
-      }
-      catch (...) {
-      }
-    }
-    catch (...) {
-      // Keep the primary error even if reporting cleanup itself cannot allocate.
-    }
-  }
-
-  void UploadParts(int source, std::uint64_t size, const S3ObjectLocation& destination,
-                   const std::string& upload_id, const std::shared_ptr<Operation>& operation,
-                   std::vector<Aws::S3::Model::CompletedPart>& completed)
-  {
-    for (std::size_t part = 0; part < completed.size(); ++part) {
-      auto buffer = std::make_shared<Slots::Lease>(buffer_slots.Acquire(*operation));
-      const auto offset = part * limits.part_size;
-      const auto length = std::min(limits.part_size, size - offset);
-      ReadPart(source, buffers[buffer->slot].data(), length, offset, *operation);
-      {
-        std::lock_guard lock(operation->mutex);
-        ++operation->pending;
-      }
-      try {
-        const bool submitted = executor->Submit([this, operation, buffer, destination, upload_id, part, length, &completed]() mutable {
-          try {
-            Aws::S3::Model::UploadPartRequest request;
-            request.WithBucket(destination.bucket).WithKey(destination.key).WithUploadId(upload_id).WithPartNumber(part + 1);
-            SendBody(request, operation, buffers[buffer->slot].data(), length, "UploadPart", [&](const auto& value) {
-              auto outcome = client->UploadPart(value);
-              if (outcome.IsSuccess())
-                completed[part].WithPartNumber(part + 1).WithETag(outcome.GetResult().GetETag());
-              return outcome;
-            });
-          }
-          catch (...) {
-            operation->Fail(std::current_exception());
-          }
-          buffer.reset();
-          operation->Finish();
-        });
-        if (!submitted)
-          throw S3Error({"schedule part", "ExecutorStopped"});
-      }
-      catch (...) {
-        operation->Finish();
-        throw;
-      }
-    }
-  }
-
-  void UploadMultipart(int source, const struct stat& status, const S3ObjectLocation& destination,
-                       const std::shared_ptr<Operation>& operation,
-                       std::string& upload_id, S3RemoteState& remote_state)
-  {
-    const auto size = static_cast<std::uint64_t>(status.st_size);
-    std::vector<Aws::S3::Model::CompletedPart> completed(size / limits.part_size + (size % limits.part_size != 0));
-    try {
-      Aws::S3::Model::CreateMultipartUploadRequest create;
-      create.WithBucket(destination.bucket).WithKey(destination.key).WithContentType("application/octet-stream");
-      remote_state = S3RemoteState::UNKNOWN;
-      auto started = RequestResult(create, operation, [&](const auto& request) { return initiation_client->CreateMultipartUpload(request); });
-      if (!started.IsSuccess())
-        throw S3Error(RequestFailure("CreateMultipartUpload", started.GetError()));
-      upload_id = started.GetResult().GetUploadId();
-      if (upload_id.empty())
-        throw S3Error({"CreateMultipartUpload", "MissingUploadId"});
-      remote_state = S3RemoteState::NOT_COMPLETED;
-      UploadParts(source, size, destination, upload_id, operation, completed);
-      operation->Drain();
-      CheckSource(source, status);
-      Aws::S3::Model::CompletedMultipartUpload parts;
-      for (const auto& part : completed)
-        parts.AddParts(part);
-      Aws::S3::Model::CompleteMultipartUploadRequest complete;
-      complete.WithBucket(destination.bucket).WithKey(destination.key).WithUploadId(upload_id).WithMultipartUpload(parts);
-      operation->Check();
-      remote_state = S3RemoteState::UNKNOWN;
-      auto finished = RequestResult(complete, operation, [&](const auto& request) { return client->CompleteMultipartUpload(request); });
-      if (!finished.IsSuccess())
-        throw S3Error(RequestFailure("CompleteMultipartUpload", finished.GetError()));
-    }
-    catch (...) {
-      // Workers reference completed until drained, including failures while scheduling parts.
-      operation->Fail(std::current_exception());
-      operation->Drain();
-      throw;
-    }
+    request.SetContinueRequestHandler([operation](const Aws::Http::HttpRequest*) { return operation->Continue(); });
+    auto completion = std::make_shared<std::promise<Aws::S3Crt::Model::PutObjectOutcome>>();
+    auto finished = completion->get_future();
+    client->PutObjectAsync(request, [completion](const auto*, const auto&, const auto& outcome, const auto&) {
+      completion->set_value(outcome);
+    });
+    // The pinned SDK invokes this completion from its request shutdown callback.
+    // Cancellation/deadline callbacks stop work; draining still owns the stream.
+    // A stalled connection is interrupted by CRT's low-speed timeout.
+    return finished.get();
   }
 
   S3UploadResult UploadFile(const std::filesystem::path& path, const S3ObjectLocation& destination,
@@ -639,23 +490,27 @@ struct S3Client::Impl {
     const auto digest = utils::ComputeFileSha256(source.get(), [&] { operation->Check(); });
     CheckSource(source.get(), status);
     operation->Check();
-    AllocateBuffers(*operation);
-    std::string upload_id;
     auto remote_state = S3RemoteState::NO_WRITES_ISSUED;
     try {
-      if (size <= limits.part_size) {
-        auto buffer = buffer_slots.Acquire(*operation);
-        ReadPart(source.get(), buffers[buffer.slot].data(), size, 0, *operation);
-        Aws::S3::Model::PutObjectRequest request;
-        request.WithBucket(destination.bucket).WithKey(destination.key);
-        remote_state = S3RemoteState::UNKNOWN;
-        SendBody(request, operation, buffers[buffer.slot].data(), size, "PutObject",
-                 [&](const auto& value) { return client->PutObject(value); });
-      } else {
-        UploadMultipart(source.get(), status, destination, operation, upload_id, remote_state);
-      }
-      remote_state = S3RemoteState::COMPLETED;
+      // Open the already-validated inode, not the caller's path a second time.
+      // A seekable stream lets CRT rewind retries without retaining the whole file.
+      auto body = Aws::MakeShared<Aws::FStream>(kAllocationTag,
+          ("/proc/self/fd/" + std::to_string(source.get())).c_str(), std::ios::in | std::ios::binary);
+      if (!*body)
+        throw S3Error({"read source", "OpenFailed"});
+      Aws::S3Crt::Model::PutObjectRequest request;
+      request.WithBucket(destination.bucket).WithKey(destination.key).WithContentLength(size);
+      request.SetContentType("application/octet-stream");
+      request.SetBody(body);
+      operation->Check();
+      remote_state = S3RemoteState::UNKNOWN;
+      const auto outcome = Upload(request, operation);
+      if (outcome.IsSuccess())
+        remote_state = S3RemoteState::COMPLETED;
+      operation->Check();
       CheckSource(source.get(), status);
+      if (!outcome.IsSuccess())
+        throw S3Error(RequestFailure("PutObject", outcome.GetError()));
       return {destination, size, digest};
     }
     catch (...) {
@@ -665,10 +520,10 @@ struct S3Client::Impl {
       catch (S3Error& error) {
         error.destination = destination;
         error.remote_state = remote_state;
-        error.upload_id = upload_id;
-        if (HasUntrackedMultipartUpload(remote_state, upload_id, size, limits))
+        // CRT owns the multipart ID and aborts on failure. Its public outcome
+        // does not verify cleanup, including lost initiation/completion replies.
+        if (remote_state == S3RemoteState::UNKNOWN && size > limits.part_size)
           error.cleanup_state = S3CleanupState::UNCONFIRMED;
-        Cleanup(error);
         throw;
       }
     }
@@ -676,16 +531,9 @@ struct S3Client::Impl {
 
   // Declaration order ensures all SDK-owned objects die before ShutdownAPI.
   SdkLease sdk;
-  const S3Connection connection;
   const S3Limits limits;
   Slots files;
-  Slots requests;
-  Slots buffer_slots;
-  std::once_flag buffers_once;
-  std::vector<std::vector<unsigned char>> buffers;
-  std::shared_ptr<Aws::Utils::Threading::PooledThreadExecutor> executor;
-  std::unique_ptr<Aws::S3::S3Client> client;
-  std::unique_ptr<Aws::S3::S3Client> initiation_client;
+  std::unique_ptr<Aws::S3Crt::S3CrtClient> client;
 };
 
 S3Client::S3Client(S3Connection connection, S3Limits limits)
@@ -707,7 +555,7 @@ S3Client::UploadFile(const std::filesystem::path& source, const S3ObjectLocation
 std::optional<std::uint64_t>
 S3Client::Head(const S3ObjectLocation& object, TransferControl control)
 {
-  Aws::S3::Model::HeadObjectRequest request;
+  Aws::S3Crt::Model::HeadObjectRequest request;
   const auto result = impl_->MetadataRequest(request, object, control, [&](const auto& value) { return impl_->client->HeadObject(value); });
   if (!result.IsSuccess()) {
     if (result.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::NOT_FOUND)
@@ -729,8 +577,11 @@ S3Client::Get(const S3ObjectLocation& object, std::size_t max_bytes, TransferCon
     return std::nullopt;
   if (*size > max_bytes)
     throw S3ResponseError("S3 object exceeds size limit");
+  // CRT issues a ranged GET, which is unsatisfiable for a zero-length object.
+  if (*size == 0)
+    return std::string{};
   BoundedBuffer buffer(max_bytes);
-  Aws::S3::Model::GetObjectRequest request;
+  Aws::S3Crt::Model::GetObjectRequest request;
   request.SetResponseStreamFactory([&buffer] {
     buffer.Reset();
     return Aws::New<Aws::IOStream>(kAllocationTag, &buffer);
@@ -750,9 +601,9 @@ S3Client::Get(const S3ObjectLocation& object, std::size_t max_bytes, TransferCon
 void
 S3Client::Put(const S3ObjectLocation& object, const std::string& bytes, std::size_t max_bytes, TransferControl control)
 {
-  if (bytes.size() > max_bytes)
-    throw std::invalid_argument("metadata exceeds size limit");
-  Aws::S3::Model::PutObjectRequest request;
+  if (bytes.size() > max_bytes || bytes.size() > impl_->limits.part_size)
+    throw std::invalid_argument("metadata exceeds size limit or single-PUT threshold");
+  Aws::S3Crt::Model::PutObjectRequest request;
   request.WithIfNoneMatch("*");
   request.SetContentLength(bytes.size());
   request.SetContentType("application/json");

@@ -92,7 +92,7 @@ ParseTransferLimits(const Json& value, S3Config& config)
   if (value.contains("limits")) {
     const auto& limits = value.at("limits");
     const std::set<std::string> allowed{"transactionSeconds", "stagingBytes", "activeTransactions", "uploadPartBytes",
-        "uploadBufferBytes", "uploadWorkers", "uploadActiveFiles", "requestSeconds", "uploadRequestRetries", "uploadConnectSeconds"};
+        "uploadBufferBytes", "uploadTargetGbps", "uploadActiveFiles", "requestSeconds", "uploadRequestRetries", "uploadConnectSeconds"};
     if (!limits.is_object())
       throw std::invalid_argument("S3 limits must be an object");
     for (const auto& [key, ignored] : limits.items()) {
@@ -105,9 +105,9 @@ ParseTransferLimits(const Json& value, S3Config& config)
     config.transaction_lifetime = std::chrono::seconds(read_limit("transactionSeconds", 7200, 7200));
     config.staging_bytes = read_limit("stagingBytes", config.staging_bytes, 1ULL << 40);
     config.active_transactions = read_limit("activeTransactions", config.active_transactions, 1024);
-    upload.part_size = read_limit("uploadPartBytes", upload.part_size, 1ULL << 30, 5 * 1024 * 1024);
-    upload.buffer_budget = read_limit("uploadBufferBytes", upload.buffer_budget, 1ULL << 30, upload.part_size);
-    upload.workers = read_limit("uploadWorkers", upload.workers, 64);
+    upload.part_size = read_limit("uploadPartBytes", upload.part_size, 1ULL << 30, 8 * 1024 * 1024);
+    upload.buffer_budget = read_limit("uploadBufferBytes", upload.buffer_budget, 16ULL << 30, std::max<std::uint64_t>(1ULL << 30, 2 * upload.part_size));
+    upload.target_gbps = read_limit("uploadTargetGbps", upload.target_gbps, 1000);
     upload.active_files = read_limit("uploadActiveFiles", upload.active_files, 64);
     upload.request_timeout = std::chrono::seconds(read_limit("requestSeconds", 60, 60));
     upload.request_retries = read_limit("uploadRequestRetries", upload.request_retries, 10, 0);
