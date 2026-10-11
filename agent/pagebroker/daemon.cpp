@@ -62,9 +62,10 @@ ConfigureNativeS3Environment(const snapshot::pagebroker::S3Config& config)
   SetNativeS3Variable("RUNAI_STREAMER_S3_MAX_RETRIES", "3");
   SetNativeS3Variable("RUNAI_STREAMER_S3_TIMEOUT", "0");
   SetNativeS3Variable("RUNAI_STREAMER_S3_REQUEST_TIMEOUT_MS", std::to_string(limits.request_timeout.count()).c_str());
-  SetNativeS3Variable("RUNAI_STREAMER_S3_MAX_INFLIGHT_MIB", std::to_string(limits.buffer_budget / (1024 * 1024)).c_str());
+  // Reader buffering is independent of the CRT uploader memory budget.
+  SetNativeS3Variable("RUNAI_STREAMER_S3_MAX_INFLIGHT_MIB", "128");
   SetNativeS3Variable("RUNAI_STREAMER_CHUNK_BYTESIZE", std::to_string(std::min<std::uint64_t>(16 * 1024 * 1024, limits.part_size)).c_str());
-  SetNativeS3Variable("RUNAI_STREAMER_S3_MAX_CONNECTIONS", std::to_string(limits.workers).c_str());
+  SetNativeS3Variable("RUNAI_STREAMER_S3_MAX_CONNECTIONS", "4");
   // An explicit empty value prevents fallback to an unrelated SDK profile CA.
   SetNativeS3Variable("AWS_CA_BUNDLE", connection.ca_file.c_str(), "configure native S3 CA");
 }
