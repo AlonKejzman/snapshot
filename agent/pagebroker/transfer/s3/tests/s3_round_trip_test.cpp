@@ -206,6 +206,32 @@ TEST_F(S3RoundTripTest, UploadsAndRestoresVerifiedTree)
   }
 }
 
+TEST_F(S3RoundTripTest, AppliesRetryLimitToEveryMetadataOperation)
+{
+  for (unsigned retries : {0U, 2U}) {
+    limits_.request_retries = retries;
+    S3Client client(connection_, limits_);
+    const auto suffix = std::to_string(retries);
+    EXPECT_THROW(client.Head(Destination("metadata-head-" + suffix)), S3Error);
+    const auto object = Destination("metadata-get-" + suffix);
+    client.Put(object, "{}", 2);
+    EXPECT_THROW(client.Get(object, 2), S3Error);
+    EXPECT_THROW(client.Put(Destination("metadata-put-" + suffix), "{}", 2), S3Error);
+  }
+  // The fixture independently checks the exact number of HTTP attempts for
+  // both the SDK metadata path and CRT, including the initial zero-retry call.
+}
+
+TEST_F(S3RoundTripTest, BoundsStalledMetadataRequests)
+{
+  limits_.request_retries = 0;
+  limits_.request_timeout = std::chrono::milliseconds(200);
+  S3Client client(connection_, limits_);
+  const auto started = std::chrono::steady_clock::now();
+  EXPECT_THROW(client.Head(Destination("metadata-stalled")), S3Error);
+  EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::milliseconds(1500));
+}
+
 TEST_F(S3RoundTripTest, PublishesAndReadsBoundedMetadata)
 {
   S3Client client(connection_, limits_);

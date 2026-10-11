@@ -80,6 +80,11 @@ class FaultService:
                         self.changed.notify_all()
                 start_response("200 OK", [("Content-Length", "0")])
                 return [b""]
+            if scenario == "metadata-stalled" and operation == "head":
+                time.sleep(2)
+                return self.error(start_response)
+            if scenario in (f"metadata-{operation}-0", f"metadata-{operation}-2"):
+                return self.error(start_response)
             if scenario == "stalled" and operation == "put":
                 time.sleep(8)
                 return self.error(start_response)
@@ -168,6 +173,11 @@ class FaultService:
             assert [item["Key"] for item in keys.get("Contents", [])] == ["roundtrip/engine-partial/first"], keys
         if self.counts["retry", "put"]:
             assert self.counts["retry", "put"] == 3, self.counts
+        for operation in ("head", "get", "put"):
+            for retries in (0, 2):
+                count = self.counts[f"metadata-{operation}-{retries}", operation]
+                if count:
+                    assert count == retries + 1, self.counts
         if self.counts["denied", "put"]:
             assert self.counts["denied", "put"] == 1, self.counts
         if self.counts["part-failure", "create"]:
