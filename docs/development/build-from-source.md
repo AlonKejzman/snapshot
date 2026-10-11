@@ -117,15 +117,15 @@ sign-off.
 
 ### PageBroker native S3 upload and restore tests
 
-These tests exercise direct AWS SDK uploads and native Model Streamer S3 reads.
+These tests exercise CRT-managed AWS SDK uploads and native Model Streamer S3 reads.
 See the [S3 storage contract](../../agent/pagebroker/S3.md) for configuration,
 ownership, integrity and failure behavior.
 
 Local native builds require a C++20 compiler, protobuf, GoogleTest, OpenSSL,
-the pinned AWS SDK for C++ S3 component, and both pinned Streamer libraries.
+the pinned AWS SDK for C++ S3 CRT component, and both pinned Streamer libraries.
 The Dockerfile builds SDK 1.11.584 at commit
 `bba3cfc14d4fc148aeee7a8ff7822dd7a9a0f4d3`, including its pinned submodules.
-For a local installation, build that revision with `BUILD_ONLY=s3`, shared
+For a local installation, build that revision with `BUILD_ONLY=s3-crt`, shared
 libraries, and `CMAKE_INSTALL_LIBDIR=lib`. Run
 `make -C agent/pagebroker test daemon MODEL_STREAMER_LIB_DIR=/path/to/libraries AWS_SDK_PREFIX=/path/to/aws-sdk`
 for filesystem, digest, and session-recovery tests. These tests need no S3

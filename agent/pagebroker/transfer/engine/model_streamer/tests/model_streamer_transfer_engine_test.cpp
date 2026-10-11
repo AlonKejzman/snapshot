@@ -94,8 +94,8 @@ class ModelStreamerTransferEngineTest : public ::testing::Test {
     options_.connection.secret_access_key = "fake-secret-key";
     options_.connection.session_token = "fake-session-token";
     options_.connection.use_virtual_addressing = false;
-    options_.upload_limits.part_size = options_.upload_limits.buffer_budget = 5 * 1024 * 1024;
-    options_.upload_limits.workers = options_.upload_limits.active_files = 1;
+    options_.upload_limits.part_size = 8 * 1024 * 1024;
+    options_.upload_limits.target_gbps = options_.upload_limits.active_files = 1;
     options_.restore_timeout = std::chrono::milliseconds(50);
   }
 

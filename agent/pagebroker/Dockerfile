@@ -7,7 +7,7 @@ ARG PAGEBROKER_BUILD_IMAGE=ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba798
 # to the matching version.
 ARG PAGEBROKER_BASE_IMAGE=nvcr.io/nvidia/distroless/cc:v4.0.8@sha256:8003f23a7122e630e3a78875dda6e68403c7ccc0adb393470a8c7739fafa4a02
 
-FROM ${DOCKER_PROXY}library/python:3.12-slim AS model-streamer-install
+FROM ${DOCKER_PROXY}library/python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS model-streamer-install
 
 COPY model-streamer-wheel.sha256 /model-streamer-wheel.sha256
 COPY model-streamer-headers.sha256 /model-streamer-headers.sha256
@@ -32,7 +32,7 @@ RUN set -eu; \
     cp "$license" /opt/model-streamer-sdk/legal/LICENSE; \
     cp "$metadata" /opt/model-streamer-sdk/legal/METADATA
 
-FROM ${DOCKER_PROXY}library/python:3.12-slim AS model-streamer-s3-install
+FROM ${DOCKER_PROXY}library/python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS model-streamer-s3-install
 
 COPY model-streamer-s3-wheel.sha256 /model-streamer-s3-wheel.sha256
 COPY --from=model-streamer-s3-wheel / /wheels/
@@ -68,7 +68,7 @@ RUN git init /src/aws-sdk-cpp \
     && git submodule update --init --recursive --depth 1
 RUN cmake -S /src/aws-sdk-cpp -B /src/aws-sdk-cpp/build -DCMAKE_BUILD_TYPE=Release \
        -DCMAKE_INSTALL_PREFIX=/opt/aws-sdk -DCMAKE_INSTALL_LIBDIR=lib \
-       -DBUILD_ONLY=s3 -DBUILD_SHARED_LIBS=ON \
+       -DBUILD_ONLY=s3-crt -DBUILD_SHARED_LIBS=ON \
        -DENABLE_TESTING=OFF -DAUTORUN_UNIT_TESTS=OFF \
     && cmake --build /src/aws-sdk-cpp/build --parallel 4 \
     && cmake --install /src/aws-sdk-cpp/build
@@ -125,7 +125,7 @@ RUN make test && make daemon && make s3-test-build
 # Smoke-test must run here: the runtime stage is distroless (no shell).
 RUN output=$(/src/pagebroker 2>&1); status=$?; \
     [ "$status" -eq 2 ]; \
-    [ "$output" = "usage: pagebroker socket_path staging_directory storage_root --max-concurrent-requests max_concurrent_requests [--storage-config path]" ]
+    [ "$output" = "usage: pagebroker socket_path staging_directory storage_root --max-concurrent-requests max_concurrent_requests" ]
 
 # Corresponding source for the statically linked protobuf. Fetched in this
 # stage, from the same libprotobuf-dev install that provided the linked

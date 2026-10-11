@@ -16,8 +16,26 @@ TEST(S3ConfigTest, HasFiniteDefaultsAndNoCredentialValues)
   const auto config = ParseS3Config(kConfig);
   EXPECT_EQ(config.prefix, "snapshots");
   EXPECT_EQ(config.transaction_lifetime, std::chrono::hours(2));
-  EXPECT_EQ(config.transfer.upload_limits.buffer_budget, 128 * 1024 * 1024);
+  EXPECT_EQ(config.transfer.upload_limits.buffer_budget, 1024ULL * 1024 * 1024);
   EXPECT_TRUE(config.transfer.connection.access_key_id.empty());
+}
+
+TEST(S3ConfigTest, UsesCrtUploadTuningAndRejectsOldWorkerCount)
+{
+  auto value = Json::parse(kConfig);
+  value["limits"] = {{"uploadTargetGbps", 25}, {"uploadPartBytes", 8 * 1024 * 1024},
+                     {"uploadBufferBytes", 1024ULL * 1024 * 1024 + 1}};
+  const auto config = ParseS3Config(value.dump());
+  EXPECT_EQ(config.transfer.upload_limits.target_gbps, 25);
+  EXPECT_EQ(config.transfer.upload_limits.part_size, 8 * 1024 * 1024);
+  value["limits"]["uploadWorkers"] = 4;
+  EXPECT_THROW(ParseS3Config(value.dump()), std::invalid_argument);
+  value["limits"] = {{"uploadPartBytes", 5 * 1024 * 1024}};
+  EXPECT_THROW(ParseS3Config(value.dump()), std::invalid_argument);
+  for (auto target : {0, 1001}) {
+    value["limits"] = {{"uploadTargetGbps", target}};
+    EXPECT_THROW(ParseS3Config(value.dump()), std::invalid_argument);
+  }
 }
 
 TEST(S3ConfigTest, ValidatesConnectionFieldsBeforeOptionalSettings)

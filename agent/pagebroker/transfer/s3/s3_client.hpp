@@ -48,20 +48,19 @@ struct S3Connection {
 S3Connection ResolveS3Credentials(S3Connection connection);
 
 // Bounds resources shared by concurrent calls to one S3Client and the duration
-// and retries of its requests. Upload parts consume fixed-size buffer slots.
+// and retries of its requests. CRT owns multipart scheduling and buffering.
 struct S3Limits {
   std::uint64_t part_size = 16 * 1024 * 1024;
-  std::uint64_t buffer_budget = 128 * 1024 * 1024;
-  // Caps request concurrency separately from admitted files and buffered parts.
-  unsigned workers = 4;
+  // CRT requires at least 1 GiB and twice part_size; allocated on demand.
+  std::uint64_t buffer_budget = 1024ULL * 1024 * 1024;
+  // CRT sizes its connection pool for this target; it is not a bandwidth cap.
+  double target_gbps = 10;
   unsigned active_files = 2;
   unsigned request_retries = 3;
   std::chrono::milliseconds connect_timeout{5000};
   std::chrono::milliseconds request_timeout{60000};
-  // Cancellation starts at this deadline; draining and cleanup may take longer.
+  // Callbacks observe this deadline; draining and cleanup may take longer.
   std::chrono::milliseconds operation_timeout = std::chrono::hours(2);
-  // Bounds multipart abort-and-check attempts after a failed upload.
-  unsigned cleanup_rounds = 2;
 
   // Rejects inconsistent part/buffer sizes, zero concurrency and invalid timeouts.
   void Validate() const;
@@ -94,8 +93,8 @@ struct S3RequestFailure {
 
 // Describes this attempt, not whether an older object exists at the same key.
 enum class S3RemoteState { NO_WRITES_ISSUED, NOT_COMPLETED, COMPLETED, UNKNOWN };
-// Whether multipart cleanup was needed and whether its completion was verified.
-enum class S3CleanupState { NOT_NEEDED, CONFIRMED, UNCONFIRMED };
+// CRT owns cleanup and does not expose confirmation of multipart aborts.
+enum class S3CleanupState { NOT_NEEDED, UNCONFIRMED };
 
 // Preserves the primary failure independently of remote outcome and cleanup.
 // An uncertain outcome must not be treated as proof that no object was written.
@@ -107,9 +106,7 @@ class S3Error : public std::runtime_error {
   S3RequestFailure primary;
   S3ObjectLocation destination;
   S3RemoteState remote_state = S3RemoteState::NO_WRITES_ISSUED;
-  std::string upload_id;
   S3CleanupState cleanup_state = S3CleanupState::NOT_NEEDED;
-  std::optional<S3RequestFailure> cleanup_failure;
 };
 
 // Reports invalid or inconsistent object sizes in otherwise successful reads.
@@ -147,7 +144,7 @@ class S3Client {
   void Put(const S3ObjectLocation& object, const std::string& bytes, std::size_t max_bytes, TransferControl control = {});
 
  private:
-  // Hides SDK types, request scheduling and shared admission/buffer accounting.
+  // Hides SDK types and shared operation admission.
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

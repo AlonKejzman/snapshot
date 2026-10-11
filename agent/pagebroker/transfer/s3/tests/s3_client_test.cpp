@@ -28,8 +28,8 @@ S3Limits
 SmallLimits()
 {
   S3Limits limits;
-  limits.part_size = limits.buffer_budget = 5 * 1024 * 1024;
-  limits.workers = limits.active_files = 1;
+  limits.part_size = 8 * 1024 * 1024;
+  limits.target_gbps = limits.active_files = 1;
   return limits;
 }
 
@@ -37,18 +37,20 @@ TEST(S3ClientTest, ValidatesResourceLimitsBeforeConstruction)
 {
   auto limits = SmallLimits();
   EXPECT_NO_THROW(limits.Validate());
-  for (auto size : {0ULL, 1ULL, 5ULL * 1024 * 1024 - 1, 5ULL * 1024 * 1024 * 1024 + 1}) {
+  for (auto size : {0ULL, 1ULL, 8ULL * 1024 * 1024 - 1, 5ULL * 1024 * 1024 * 1024 + 1}) {
     auto bad = limits;
     bad.part_size = size;
     EXPECT_THROW(S3Client(OfflineConnection(), bad), std::invalid_argument);
   }
   auto bad = limits;
   ++bad.buffer_budget;
-  EXPECT_THROW(bad.Validate(), std::invalid_argument);
-  bad.buffer_budget = 0;
-  EXPECT_THROW(bad.Validate(), std::invalid_argument);
+  EXPECT_NO_THROW(bad.Validate());
+  for (auto memory : {0ULL, 128ULL * 1024 * 1024, (1ULL << 30) - 1}) {
+    bad.buffer_budget = memory;
+    EXPECT_THROW(S3Client(OfflineConnection(), bad), std::invalid_argument);
+  }
   bad = limits;
-  bad.workers = 0;
+  bad.target_gbps = 0;
   EXPECT_THROW(bad.Validate(), std::invalid_argument);
   bad = limits;
   bad.active_files = 0;
@@ -57,7 +59,7 @@ TEST(S3ClientTest, ValidatesResourceLimitsBeforeConstruction)
   bad.request_retries = std::numeric_limits<unsigned>::max();
   EXPECT_THROW(bad.Validate(), std::invalid_argument);
   bad = limits;
-  bad.cleanup_rounds = 0;
+  bad.target_gbps = std::numeric_limits<double>::quiet_NaN();
   EXPECT_THROW(bad.Validate(), std::invalid_argument);
   for (auto duration : {std::chrono::milliseconds(0), std::chrono::milliseconds(-1),
                         std::chrono::milliseconds::max()}) {
