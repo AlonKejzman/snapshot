@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr/testr"
@@ -261,7 +262,7 @@ func TestCaptureRootfsDiff(t *testing.T) {
 			t.Fatalf("write upperdir file: %v", err)
 		}
 
-		got, err := CaptureRootfsDiff(upperDir, checkpointDir, types.OverlaySettings{}, nil)
+		got, err := CaptureRootfsDiff(upperDir, checkpointDir, types.OverlaySettings{}, nil, nil, testr.New(t))
 		if err != nil {
 			t.Fatalf("CaptureRootfsDiff: %v", err)
 		}
@@ -301,7 +302,7 @@ func TestCaptureRootfsDiff(t *testing.T) {
 		checkpointDir := t.TempDir()
 		missingUpperDir := filepath.Join(t.TempDir(), "missing")
 
-		if _, err := CaptureRootfsDiff(missingUpperDir, checkpointDir, types.OverlaySettings{}, nil); err == nil {
+		if _, err := CaptureRootfsDiff(missingUpperDir, checkpointDir, types.OverlaySettings{}, nil, nil, testr.New(t)); err == nil {
 			t.Fatal("CaptureRootfsDiff should fail for missing upperdir")
 		}
 		if _, err := os.Stat(filepath.Join(checkpointDir, rootfsDiffFilename)); !os.IsNotExist(err) {
@@ -315,6 +316,114 @@ func TestCaptureRootfsDiff(t *testing.T) {
 			t.Fatalf("temporary rootfs diff files were not cleaned up: %v", matches)
 		}
 	})
+
+	t.Run("exclusions keep referenced files", func(t *testing.T) {
+		upperDir := t.TempDir()
+		checkpointDir := t.TempDir()
+		writeUpper := func(rel, data string) {
+			t.Helper()
+			path := filepath.Join(upperDir, rel)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatalf("mkdir for %s: %v", rel, err)
+			}
+			if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+				t.Fatalf("write %s: %v", rel, err)
+			}
+		}
+		writeUpper("root/.triton/cache/K/cuda_utils.so", "mapped launcher")
+		writeUpper("root/.triton/cache/K/kernel.cubin", "cached kernel")
+		writeUpper("root/.cache/vllm/torch_compile_cache/model", "compiled graph")
+		writeUpper("root/.cache/flashinfer/jit.log", "open log")
+		writeUpper("root/kept.txt", "not excluded")
+		writeUpper("data/stale", "shadowed by a volume")
+		// Ancestor modes must survive even though the exclusion dropped the directories.
+		if err := os.Chmod(filepath.Join(upperDir, "root/.triton/cache/K"), 0o700); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		// An upperdir symlink must never be followed to reach a referenced name.
+		outside := t.TempDir()
+		if err := os.WriteFile(filepath.Join(outside, "secret"), []byte("host file"), 0o600); err != nil {
+			t.Fatalf("write outside file: %v", err)
+		}
+		if err := os.Symlink(outside, filepath.Join(upperDir, "root/.cache/link")); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+
+		exclusions := types.OverlaySettings{Exclusions: []string{"*/.triton", "*/.cache/vllm", "*/.cache/flashinfer", "*/.cache/link"}}
+		referenced := []string{
+			"/root/.triton/cache/K/cuda_utils.so",
+			"/root/.cache/flashinfer/jit.log",
+			"/root/kept.txt",
+			"/data/stale",
+			"/root/.cache/link/secret",
+			"/usr/lib/x86_64-linux-gnu/libc.so.6", // in the image, not the upperdir
+			"/",
+		}
+		if _, err := CaptureRootfsDiff(upperDir, checkpointDir, exclusions, []string{"/data"}, referenced, testr.New(t)); err != nil {
+			t.Fatalf("CaptureRootfsDiff: %v", err)
+		}
+
+		archive := filepath.Join(checkpointDir, rootfsDiffFilename)
+		listing, err := exec.Command("tar", "-tf", archive).Output()
+		if err != nil {
+			t.Fatalf("list rootfs diff: %v", err)
+		}
+		counts := make(map[string]int)
+		for _, name := range strings.Split(strings.TrimSpace(string(listing)), "\n") {
+			counts[name]++
+		}
+		for name, count := range counts {
+			if count != 1 {
+				t.Errorf("member %q archived %d times", name, count)
+			}
+		}
+
+		targetRoot := t.TempDir()
+		if err := ApplyRootfsDiff(checkpointDir, targetRoot, testBundle(t), testr.New(t)); err != nil {
+			t.Fatalf("ApplyRootfsDiff: %v", err)
+		}
+		for rel, want := range map[string]string{
+			"root/.triton/cache/K/cuda_utils.so": "mapped launcher",
+			"root/.cache/flashinfer/jit.log":     "open log",
+			"root/kept.txt":                      "not excluded",
+		} {
+			data, err := os.ReadFile(filepath.Join(targetRoot, rel))
+			if err != nil || string(data) != want {
+				t.Errorf("%s = %q, %v; want %q", rel, data, err, want)
+			}
+		}
+		for _, rel := range []string{
+			"root/.triton/cache/K/kernel.cubin",
+			"root/.cache/vllm",
+			"data/stale",
+			"root/.cache/link",
+		} {
+			if _, err := os.Lstat(filepath.Join(targetRoot, rel)); !os.IsNotExist(err) {
+				t.Errorf("%s should not be restored, stat error: %v", rel, err)
+			}
+		}
+		info, err := os.Stat(filepath.Join(targetRoot, "root/.triton/cache/K"))
+		if err != nil {
+			t.Fatalf("stat restored ancestor: %v", err)
+		}
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Errorf("restored ancestor mode = %o, want 700", got)
+		}
+	})
+}
+
+func TestUnarchivedMembers(t *testing.T) {
+	listing := "./\n./root/\n./root/kept.txt\n./usr/\n"
+	members, files := unarchivedMembers([]string{"root/.triton/cache/K/a.so", "root/.triton/cache/K/b.so", "root/kept.txt"}, listing)
+
+	wantMembers := []string{"./root/.triton", "./root/.triton/cache", "./root/.triton/cache/K", "./root/.triton/cache/K/a.so", "./root/.triton/cache/K/b.so"}
+	if !slices.Equal(members, wantMembers) {
+		t.Errorf("members = %q, want %q", members, wantMembers)
+	}
+	wantFiles := []string{"/root/.triton/cache/K/a.so", "/root/.triton/cache/K/b.so"}
+	if !slices.Equal(files, wantFiles) {
+		t.Errorf("files = %q, want %q", files, wantFiles)
+	}
 }
 
 func TestApplyRootfsDiff(t *testing.T) {
@@ -363,7 +472,7 @@ func TestApplyRootfsDiff(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(upperDir, "generated.txt"), []byte("runtime data"), 0644); err != nil {
 			t.Fatalf("write upperdir file: %v", err)
 		}
-		if _, err := CaptureRootfsDiff(upperDir, checkpointDir, types.OverlaySettings{}, nil); err != nil {
+		if _, err := CaptureRootfsDiff(upperDir, checkpointDir, types.OverlaySettings{}, nil, nil, testr.New(t)); err != nil {
 			t.Fatalf("CaptureRootfsDiff: %v", err)
 		}
 
@@ -583,7 +692,7 @@ func TestRootfsDiffPreservesCapabilities(t *testing.T) {
 		t.Fatalf("set user xattr: %v", err)
 	}
 
-	if _, err := CaptureRootfsDiff(upperDir, checkpointDir, types.OverlaySettings{}, nil); err != nil {
+	if _, err := CaptureRootfsDiff(upperDir, checkpointDir, types.OverlaySettings{}, nil, nil, testr.New(t)); err != nil {
 		t.Fatalf("CaptureRootfsDiff: %v", err)
 	}
 	if err := ApplyRootfsDiff(checkpointDir, targetRoot, testBundle(t), testr.New(t)); err != nil {

@@ -249,7 +249,9 @@ config:
   overlay:
     # Rootfs diff tar exclusions. Absolute-looking paths are normalized
     # relative to the tar root, and patterns starting with * are passed
-    # through as tar globs unchanged.
+    # through as tar globs unchanged. A file the checkpointed processes hold
+    # open or mapped is archived even when an exclusion matches it, so
+    # regenerable caches can be excluded without breaking restore.
     exclusions:
       - /proc
       - /sys

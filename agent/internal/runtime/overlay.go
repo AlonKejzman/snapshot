@@ -4,12 +4,14 @@
 package runtime
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -56,10 +58,16 @@ func GetOverlayUpperDir(pid int) (string, error) {
 
 // CaptureRootfsDiff captures the overlay upperdir to a tar file.
 //
+// referenced lists the container paths the checkpointed processes hold open or
+// mapped (criu.ReferencedPaths). Restore re-opens each one by path, so any of
+// them found in the upperdir is archived even when an exclusion matches it:
+// exclusions can trim regenerable state such as compiler caches without
+// dropping a file the restored processes need.
+//
 // The archive is written to a temporary file first and renamed atomically on
 // success, so a partial or failed capture never leaves a corrupt archive at the
 // final path.
-func CaptureRootfsDiff(upperDir, checkpointDir string, exclusions types.OverlaySettings, bindMountDests []string) (string, error) {
+func CaptureRootfsDiff(upperDir, checkpointDir string, exclusions types.OverlaySettings, bindMountDests, referenced []string, log logr.Logger) (string, error) {
 	if upperDir == "" {
 		return "", fmt.Errorf("upperdir is empty")
 	}
@@ -81,10 +89,27 @@ func CaptureRootfsDiff(upperDir, checkpointDir string, exclusions types.OverlayS
 		}
 	}()
 
-	cmd := exec.Command("tar", captureTarArgs(upperDir, tmpPath, exclusions, bindMountDests)...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("tar failed: %w (output: %s)", err, string(output))
+	kept := referencedUpperPaths(upperDir, bindMountDests, referenced)
+	args := captureTarArgs(upperDir, tmpPath, exclusions, bindMountDests)
+	if len(kept) > 0 {
+		// The member listing tells which referenced paths the exclusions dropped.
+		args = append([]string{"--verbose", "--quoting-style=literal"}, args...)
+	}
+	var listing, stderr bytes.Buffer
+	cmd := exec.Command("tar", args...)
+	cmd.Stdout = &listing
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("tar failed: %w (output: %s)", err, stderr.String())
+	}
+
+	if members, files := unarchivedMembers(kept, listing.String()); len(members) > 0 {
+		cmd := exec.Command("tar", appendTarArgs(upperDir, tmpPath)...)
+		cmd.Stdin = strings.NewReader(strings.Join(members, "\x00") + "\x00")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("tar append of referenced files failed: %w (output: %s)", err, string(output))
+		}
+		log.Info("Kept referenced files matched by rootfs exclusions", "count", len(files), "paths", firstN(files, 20))
 	}
 
 	info, err := os.Stat(tmpPath)
@@ -117,6 +142,94 @@ func captureTarArgs(upperDir, outPath string, exclusions types.OverlaySettings, 
 		args = append(args, "--exclude=."+dest)
 	}
 	return append(args, "-C", upperDir, "-cf", outPath, ".")
+}
+
+// appendTarArgs builds the arguments that append the NUL-separated members
+// read from stdin to an archive captureTarArgs created, with the same xattr
+// handling and without descending into directories.
+func appendTarArgs(upperDir, outPath string) []string {
+	return []string{
+		"--xattrs", "--xattrs-exclude=trusted.*", "--no-recursion",
+		"-C", upperDir, "-rf", outPath, "--null", "--verbatim-files-from", "-T", "-",
+	}
+}
+
+// referencedUpperPaths returns, relative to the upperdir and sorted, the
+// referenced paths that are regular files or directories in the upperdir.
+// Paths under bind mounts and kernel filesystems are skipped: the restore
+// container provides those, and the upperdir can only hold stale copies shadowed
+// by the mount. A path is also skipped when an upperdir ancestor is not a
+// directory, so archiving it by name never resolves through a symlink.
+func referencedUpperPaths(upperDir string, bindMountDests, referenced []string) []string {
+	skipped := append([]string{"/proc", "/sys", "/dev"}, bindMountDests...)
+	var kept []string
+	for _, p := range referenced {
+		p = filepath.Clean(p)
+		if !filepath.IsAbs(p) || p == "/" || slices.ContainsFunc(skipped, func(mount string) bool { return underPath(p, mount) }) {
+			continue
+		}
+		rel := strings.TrimPrefix(p, "/")
+		if isUpperDirEntry(upperDir, rel) {
+			kept = append(kept, rel)
+		}
+	}
+	slices.Sort(kept)
+	return slices.Compact(kept)
+}
+
+// isUpperDirEntry reports whether rel is a regular file or directory in the
+// upperdir, reached through real directories only.
+func isUpperDirEntry(upperDir, rel string) bool {
+	current := upperDir
+	parts := strings.Split(rel, "/")
+	for _, part := range parts[:len(parts)-1] {
+		current = filepath.Join(current, part)
+		if info, err := os.Lstat(current); err != nil || !info.IsDir() {
+			return false
+		}
+	}
+	info, err := os.Lstat(filepath.Join(current, parts[len(parts)-1]))
+	return err == nil && (info.Mode().IsRegular() || info.IsDir())
+}
+
+// unarchivedMembers returns the archive members to append so every kept path
+// is in the archive: each kept path, preceded by its ancestors, that the
+// listing of the created archive does not name. files holds the kept paths
+// among them. Ancestors are archived too so the restored directories keep
+// their modes and owners. A name the literal listing cannot represent, such as
+// one containing a newline, is appended again; extraction skips the duplicate.
+func unarchivedMembers(kept []string, listing string) (members, files []string) {
+	archived := make(map[string]struct{})
+	for _, line := range strings.Split(listing, "\n") {
+		archived[strings.TrimSuffix(strings.TrimPrefix(line, "./"), "/")] = struct{}{}
+	}
+	for _, rel := range kept {
+		parts := strings.Split(rel, "/")
+		for i := range parts {
+			name := strings.Join(parts[:i+1], "/")
+			if _, ok := archived[name]; ok {
+				continue
+			}
+			archived[name] = struct{}{}
+			members = append(members, "./"+name)
+			if name == rel {
+				files = append(files, "/"+rel)
+			}
+		}
+	}
+	return members, files
+}
+
+func underPath(p, root string) bool {
+	root = filepath.Clean(root)
+	return p == root || strings.HasPrefix(p, root+"/")
+}
+
+func firstN(values []string, n int) []string {
+	if len(values) <= n {
+		return values
+	}
+	return values[:n]
 }
 
 // buildExclusions merges exclusion lists and normalizes paths for tar --exclude patterns.

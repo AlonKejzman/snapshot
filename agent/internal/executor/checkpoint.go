@@ -412,7 +412,12 @@ func captureCheckpoint(ctx context.Context, criuOpts *criurpc.CriuOpts, criuSett
 	// (the base container image provides the filesystem).
 	if state.UpperDir != "" {
 		overlayCaptureStart := time.Now()
-		if _, err := snapshotruntime.CaptureRootfsDiff(state.UpperDir, checkpointDir, data.Overlay.Exclusions, data.Overlay.BindMountDests); err != nil {
+		referenced, err := criu.ReferencedPaths(checkpointDir)
+		if err != nil {
+			// Exclusions still apply; only the guarantee that they keep referenced files is lost.
+			log.Error(err, "Failed to read the files referenced by the dump")
+		}
+		if _, err := snapshotruntime.CaptureRootfsDiff(state.UpperDir, checkpointDir, data.Overlay.Exclusions, data.Overlay.BindMountDests, referenced, log); err != nil {
 			log.Error(err, "Failed to capture rootfs diff")
 		}
 		if _, err := snapshotruntime.CaptureDeletedFiles(state.UpperDir, checkpointDir); err != nil {
