@@ -423,8 +423,10 @@ func captureCheckpoint(ctx context.Context, criuOpts *criurpc.CriuOpts, criuSett
 //
 // Overlay rootfs diff capture is best-effort. Failures are logged but not
 // propagated — a checkpoint without overlay diffs is still valid for restore
-// (the base container image provides the filesystem). A dump whose referenced
-// files cannot be read fails instead: restore decodes the same images.
+// (the base container image provides the filesystem). Two failures are fatal
+// instead, because restore would then fail: a dump whose referenced files
+// cannot be read, since restore decodes the same images, and a rootfs diff
+// that may lack a referenced upperdir file, which restore reopens.
 func captureOverlay(upperDir string, overlay types.OverlayManifest, checkpointDir string, log logr.Logger) error {
 	referenced, err := criu.ReadReferencedPaths(checkpointDir)
 	if err != nil {
@@ -435,6 +437,9 @@ func captureOverlay(upperDir string, overlay types.OverlayManifest, checkpointDi
 		BindMountDests: overlay.BindMountDests,
 		Keep:           referenced,
 	})
+	if errors.Is(err, snapshotruntime.ErrKeptFilesMissing) {
+		return fmt.Errorf("capture rootfs diff: %w", err)
+	}
 	if err != nil {
 		log.Error(err, "Failed to capture rootfs diff")
 	} else if len(diff.Kept) > 0 {

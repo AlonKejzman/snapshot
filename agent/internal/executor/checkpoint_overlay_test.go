@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
+	snapshotruntime "github.com/ai-dynamo/snapshot/agent/internal/runtime"
 	"github.com/ai-dynamo/snapshot/agent/internal/types"
 )
 
@@ -66,6 +67,34 @@ func TestCaptureOverlayKeepsOnlyRootMountFiles(t *testing.T) {
 	members := overlayTestArchiveMembers(t, filepath.Join(checkpointDir, "rootfs-diff.tar"))
 	assert.Contains(t, members, "./root/.triton/cache/K/cuda_utils.so")
 	assert.NotContains(t, members, "./cache/model.bin")
+}
+
+// A rootfs diff that may lack a referenced upperdir file fails the capture,
+// because restore would fail reopening that file.
+func TestCaptureOverlayFailsWhenAReferencedFileMayBeMissing(t *testing.T) {
+	upperDir := t.TempDir()
+	checkpointDir := t.TempDir()
+	writeOverlayTestFile(t, upperDir, "root/.triton/cache/K/cuda_utils.so", "mapped")
+	writeOverlayTestDump(t, checkpointDir,
+		newOverlayTestRegFile(1, "/root/.triton/cache/K/cuda_utils.so", overlayTestRootMount))
+	// A non-empty directory at the archive's final path fails the publish.
+	writeOverlayTestFile(t, checkpointDir, "rootfs-diff.tar/occupied", "")
+
+	err := captureOverlay(upperDir, types.OverlayManifest{}, checkpointDir, logr.Discard())
+	require.ErrorIs(t, err, snapshotruntime.ErrKeptFilesMissing)
+}
+
+// Other rootfs diff failures stay best-effort when the image provides every
+// referenced file.
+func TestCaptureOverlayLogsFailuresThatLoseNoReferencedFile(t *testing.T) {
+	upperDir := t.TempDir()
+	checkpointDir := t.TempDir()
+	writeOverlayTestFile(t, upperDir, "root/other.txt", "not referenced")
+	writeOverlayTestDump(t, checkpointDir,
+		newOverlayTestRegFile(1, "/usr/lib/x86_64-linux-gnu/libc.so.6", overlayTestRootMount))
+	writeOverlayTestFile(t, checkpointDir, "rootfs-diff.tar/occupied", "")
+
+	require.NoError(t, captureOverlay(upperDir, types.OverlayManifest{}, checkpointDir, logr.Discard()))
 }
 
 // writeOverlayTestDump writes the images criu.ReadReferencedPaths reads: the

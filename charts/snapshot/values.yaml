@@ -251,8 +251,8 @@ config:
     # relative to the tar root, and patterns starting with * are passed
     # through as tar globs unchanged. A file the checkpointed processes hold
     # open or mapped at dump time is archived even when an exclusion matches
-    # it, so CRIU can reopen it. Other excluded files are not restored, so an
-    # excluded cache starts cold and the workload regenerates it on demand.
+    # it, so CRIU can reopen it. Other excluded files are not restored; the
+    # workload must recreate them if needed.
     exclusions:
       - /proc
       - /sys

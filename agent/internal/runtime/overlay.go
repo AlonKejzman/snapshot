@@ -82,11 +82,18 @@ type RootfsDiff struct {
 	KeptBytes int64
 }
 
+// ErrKeptFilesMissing marks a CaptureRootfsDiff failure that may have left a
+// Keep path out of the rootfs diff, because the path is in the upperdir or
+// could not be inspected there.
+var ErrKeptFilesMissing = errors.New("rootfs diff may lack files that must be kept")
+
 // CaptureRootfsDiff captures the overlay upperdir to a tar file.
 //
 // Files and directories in opts.Keep that are in the upperdir are kept even
 // when they match an exclusion. Keep paths missing from the upperdir, or that
-// would be reached through a symlink there, are skipped.
+// would be reached through a symlink there, are skipped. Once a Keep path is
+// found in the upperdir or cannot be inspected, any failure wraps
+// ErrKeptFilesMissing.
 //
 // The archive is written to a temporary file first and renamed atomically on
 // success, so a partial or failed capture never leaves a corrupt archive at the
@@ -95,7 +102,21 @@ func CaptureRootfsDiff(upperDir, checkpointDir string, opts RootfsDiffOptions) (
 	if upperDir == "" {
 		return RootfsDiff{}, fmt.Errorf("upperdir is empty")
 	}
+	keep, err := upperDirEntries(upperDir, opts.Keep)
+	if err != nil {
+		return RootfsDiff{}, fmt.Errorf("%w: %w", ErrKeptFilesMissing, err)
+	}
+	diff, err := writeRootfsDiff(upperDir, checkpointDir, opts, keep)
+	if err != nil && len(keep) > 0 {
+		return RootfsDiff{}, fmt.Errorf("%w: %w", ErrKeptFilesMissing, err)
+	}
+	return diff, err
+}
 
+// writeRootfsDiff archives the upperdir with the exclusions in opts, appends
+// the keep entries the exclusions left out, and publishes the archive in
+// checkpointDir.
+func writeRootfsDiff(upperDir, checkpointDir string, opts RootfsDiffOptions, keep map[string]int64) (RootfsDiff, error) {
 	rootfsDiffPath := filepath.Join(checkpointDir, rootfsDiffFilename)
 
 	tmpFile, err := os.CreateTemp(checkpointDir, rootfsDiffFilename+".*.tmp")
@@ -112,11 +133,6 @@ func CaptureRootfsDiff(upperDir, checkpointDir string, opts RootfsDiffOptions) (
 			_ = os.Remove(tmpPath)
 		}
 	}()
-
-	keep, err := upperDirEntries(upperDir, opts.Keep)
-	if err != nil {
-		return RootfsDiff{}, err
-	}
 
 	cmd := exec.Command("tar", captureTarArgs(upperDir, tmpPath, opts.Exclusions, opts.BindMountDests)...)
 	output, err := cmd.CombinedOutput()

@@ -435,10 +435,42 @@ func TestCaptureRootfsDiff(t *testing.T) {
 		tooLong := "/root/" + strings.Repeat("x", 300)
 
 		_, err := CaptureRootfsDiff(upperDir, checkpointDir, RootfsDiffOptions{Keep: []string{"/root/kept.txt", tooLong}})
-		if !errors.Is(err, unix.ENAMETOOLONG) {
-			t.Fatalf("CaptureRootfsDiff() error = %v, want ENAMETOOLONG", err)
+		if !errors.Is(err, unix.ENAMETOOLONG) || !errors.Is(err, ErrKeptFilesMissing) {
+			t.Fatalf("CaptureRootfsDiff() error = %v, want ENAMETOOLONG and ErrKeptFilesMissing", err)
 		}
 		assertNoRootfsDiff(t, checkpointDir)
+	})
+
+	// A non-empty directory at the archive's final path fails the publish,
+	// after the kept paths were inspected and the archive was written.
+	blockPublish := func(t *testing.T, checkpointDir string) {
+		t.Helper()
+		writeUpperFile(t, checkpointDir, filepath.Join(rootfsDiffFilename, "occupied"), "")
+	}
+
+	t.Run("a later failure with a kept file in the upperdir is marked", func(t *testing.T) {
+		upperDir := t.TempDir()
+		checkpointDir := t.TempDir()
+		writeUpperFile(t, upperDir, "root/kept.txt", "kept")
+		blockPublish(t, checkpointDir)
+
+		_, err := CaptureRootfsDiff(upperDir, checkpointDir, RootfsDiffOptions{Keep: []string{"/root/kept.txt"}})
+		if !errors.Is(err, ErrKeptFilesMissing) || !strings.Contains(err.Error(), "failed to publish rootfs diff") {
+			t.Fatalf("CaptureRootfsDiff() error = %v, want a publish failure marked ErrKeptFilesMissing", err)
+		}
+	})
+
+	t.Run("a failure without kept files in the upperdir is not marked", func(t *testing.T) {
+		upperDir := t.TempDir()
+		checkpointDir := t.TempDir()
+		writeUpperFile(t, upperDir, "root/other.txt", "not kept")
+		blockPublish(t, checkpointDir)
+
+		// The image provides the file; the upperdir has no copy to lose.
+		_, err := CaptureRootfsDiff(upperDir, checkpointDir, RootfsDiffOptions{Keep: []string{"/usr/lib/x86_64-linux-gnu/libc.so.6"}})
+		if err == nil || errors.Is(err, ErrKeptFilesMissing) {
+			t.Fatalf("CaptureRootfsDiff() error = %v, want an unmarked publish failure", err)
+		}
 	})
 }
 
