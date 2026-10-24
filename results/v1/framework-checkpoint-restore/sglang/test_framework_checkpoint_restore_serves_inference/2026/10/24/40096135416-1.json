@@ -1,0 +1,39 @@
+{
+  "benchmarkVersion": 1,
+  "environment": {
+    "collectionError": "matrix job produced no valid benchmark artifact"
+  },
+  "error": {
+    "message": "no benchmark artifact was uploaded",
+    "phase": "artifact_collection"
+  },
+  "events": [],
+  "finishedAt": "2026-10-24T13:00:05.196Z",
+  "identity": {
+    "case": "sglang",
+    "runAttempt": 1,
+    "runId": "40096135416",
+    "suite": "framework-checkpoint-restore",
+    "test": "test_framework_checkpoint_restore_serves_inference"
+  },
+  "measurements": [
+    {
+      "displayName": "Full E2E test",
+      "missingReason": "test result artifact unavailable",
+      "name": "test.total.duration",
+      "status": "incomplete",
+      "unit": "seconds",
+      "value": null
+    }
+  ],
+  "outcome": "infrastructure_failed",
+  "schemaVersion": 1,
+  "source": {
+    "commit": "abb87631b948b08a1a4722eb19185aba14768c85",
+    "event": "schedule",
+    "ref": "refs/heads/main",
+    "runUrl": "https://github.com/AlonKejzman/snapshot/actions/runs/40096135416",
+    "snapshotTag": null
+  },
+  "startedAt": "2026-10-24T13:00:05.196Z"
+}
