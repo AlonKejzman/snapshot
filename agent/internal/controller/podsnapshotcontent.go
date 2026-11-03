@@ -81,7 +81,10 @@ func (w *NodeController) reconcileCapture(ctx context.Context, name string) erro
 	if err != nil {
 		return err
 	}
-	if content == nil || content.Spec.Source.NodeName != w.config.NodeName ||
+	// An import names an existing artifact and has no node: there is nothing to capture. The
+	// informer's node label already keeps it out; this keeps the pod reads below safe regardless.
+	if content == nil || content.IsImported() || content.Spec.Source.PodRef == nil ||
+		content.Spec.Source.NodeName != w.config.NodeName ||
 		!content.DeletionTimestamp.IsZero() || isContentTerminal(content) {
 		w.checkpointGates.Delete(name)
 		return nil
