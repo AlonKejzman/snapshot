@@ -212,11 +212,11 @@ func TestRemoveControlSentinel_MissingDir(t *testing.T) {
 }
 
 func TestPodControlVolumeDir(t *testing.T) {
-	dir, err := podControlVolumeDir(KubeletPodsDir, "0f6c2c1e-uid", "engine-0")
+	dir, err := podControlVolumeDir("0f6c2c1e-uid", "engine-0")
 	if err != nil {
 		t.Fatalf("podControlVolumeDir: %v", err)
 	}
-	want := "/host/proc/1/root/var/lib/kubelet/pods/0f6c2c1e-uid/volumes/kubernetes.io~empty-dir/snapshot-control"
+	want := "var/lib/kubelet/pods/0f6c2c1e-uid/volumes/kubernetes.io~empty-dir/snapshot-control"
 	if dir != want {
 		t.Errorf("podControlVolumeDir = %q, want %q", dir, want)
 	}
@@ -228,25 +228,26 @@ func TestPodControlVolumeDir(t *testing.T) {
 		{"uid", "../other"},
 		{"a/b", "main"},
 	} {
-		if _, err := podControlVolumeDir(KubeletPodsDir, tc.uid, tc.container); err == nil {
+		if _, err := podControlVolumeDir(tc.uid, tc.container); err == nil {
 			t.Errorf("podControlVolumeDir(%q, %q) succeeded, want error", tc.uid, tc.container)
 		}
 	}
 }
 
-// podsDirWithControlVolume returns a stand-in for KubeletPodsDir holding the
+// nodeRootWithControlVolume returns a stand-in for NodeRootPath holding the
 // snapshot-control volume of Pod "uid", as kubelet sets it up.
-func podsDirWithControlVolume(t *testing.T) (podsDir, volume string) {
+func nodeRootWithControlVolume(t *testing.T) (nodeRoot, volume string) {
 	t.Helper()
-	podsDir = t.TempDir()
-	volume, err := podControlVolumeDir(podsDir, "uid", "main")
+	nodeRoot = t.TempDir()
+	rel, err := podControlVolumeDir("uid", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
+	volume = filepath.Join(nodeRoot, rel)
 	if err := os.MkdirAll(volume, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return podsDir, volume
+	return nodeRoot, volume
 }
 
 func writeString(dir *os.File, name, contents string, perm os.FileMode) error {
@@ -257,9 +258,9 @@ func writeString(dir *os.File, name, contents string, perm os.FileMode) error {
 }
 
 func TestOpenPodControlDirCreatesContainerDir(t *testing.T) {
-	podsDir, volume := podsDirWithControlVolume(t)
+	nodeRoot, volume := nodeRootWithControlVolume(t)
 
-	dir, err := openPodControlDir(podsDir, "uid", "main")
+	dir, err := openPodControlDir(nodeRoot, "uid", "main")
 	if err != nil {
 		t.Fatalf("openPodControlDir: %v", err)
 	}
@@ -278,6 +279,61 @@ func TestOpenPodControlDirCreatesContainerDir(t *testing.T) {
 	}
 }
 
+// Nodes that keep kubelet's state elsewhere make /var/lib/kubelet an absolute
+// symlink, here to /mnt/nvme/kubelet. Joined onto the node root as a path, the
+// kernel resolved that target against the agent's own root and found nothing,
+// so every restore on such a node failed to install its restore proxy.
+func TestOpenPodControlDirFollowsAbsoluteKubeletSymlinkInsideNodeRoot(t *testing.T) {
+	nodeRoot := t.TempDir()
+	real := filepath.Join(nodeRoot, "mnt", "nvme", "kubelet")
+	volume := filepath.Join(real, "pods", "uid", "volumes", "kubernetes.io~empty-dir", "snapshot-control")
+	if err := os.MkdirAll(volume, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(nodeRoot, "var", "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/mnt/nvme/kubelet", filepath.Join(nodeRoot, "var", "lib", "kubelet")); err != nil {
+		t.Fatal(err)
+	}
+
+	dir, err := openPodControlDir(nodeRoot, "uid", "main")
+	if err != nil {
+		t.Fatalf("openPodControlDir through the symlinked kubelet dir: %v", err)
+	}
+	defer dir.Close()
+	if err := writeString(dir, "restore-failed", "failed\n", 0o644); err != nil {
+		t.Fatalf("WriteFileInDir: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(volume, "main", "restore-failed")); err != nil || string(data) != "failed\n" {
+		t.Fatalf("restore-failed = %q, %v", data, err)
+	}
+}
+
+// Resolving inside the node root also keeps a symlink from leading out of it:
+// one pointing above the root lands back inside, where nothing is.
+func TestOpenPodControlDirResolvesNothingOutsideNodeRoot(t *testing.T) {
+	outside := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(outside, "pods", "uid", "volumes", "kubernetes.io~empty-dir", "snapshot-control"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nodeRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(nodeRoot, "var", "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(nodeRoot, "var", "lib", "kubelet")); err != nil {
+		t.Fatal(err)
+	}
+
+	if dir, err := openPodControlDir(nodeRoot, "uid", "main"); err == nil {
+		dir.Close()
+		t.Fatal("opened a control volume outside the node root")
+	}
+	if entries, _ := os.ReadDir(filepath.Join(outside, "pods", "uid", "volumes", "kubernetes.io~empty-dir", "snapshot-control")); len(entries) != 0 {
+		t.Fatalf("wrote outside the node root: %v", entries)
+	}
+}
+
 func TestOpenPodControlDirRequiresVolume(t *testing.T) {
 	if _, err := openPodControlDir(t.TempDir(), "uid", "main"); err == nil {
 		t.Fatal("expected an error when kubelet has not set up the volume")
@@ -287,13 +343,13 @@ func TestOpenPodControlDirRequiresVolume(t *testing.T) {
 // The Pod can change everything inside its control volume. A symlink there
 // must not lead a write outside it.
 func TestOpenPodControlDirRefusesSymlinkedContainerDir(t *testing.T) {
-	podsDir, volume := podsDirWithControlVolume(t)
+	nodeRoot, volume := nodeRootWithControlVolume(t)
 	elsewhere := t.TempDir()
 	if err := os.Symlink(elsewhere, filepath.Join(volume, "main")); err != nil {
 		t.Fatal(err)
 	}
 
-	if dir, err := openPodControlDir(podsDir, "uid", "main"); err == nil {
+	if dir, err := openPodControlDir(nodeRoot, "uid", "main"); err == nil {
 		dir.Close()
 		t.Fatal("expected an error for a symlinked container directory")
 	}
@@ -303,7 +359,7 @@ func TestOpenPodControlDirRefusesSymlinkedContainerDir(t *testing.T) {
 }
 
 func TestWriteFileInDirReplacesSymlinkWithoutFollowing(t *testing.T) {
-	podsDir, volume := podsDirWithControlVolume(t)
+	nodeRoot, volume := nodeRootWithControlVolume(t)
 	target := filepath.Join(t.TempDir(), "target")
 	if err := os.WriteFile(target, []byte("keep"), 0o644); err != nil {
 		t.Fatal(err)
@@ -314,7 +370,7 @@ func TestWriteFileInDirReplacesSymlinkWithoutFollowing(t *testing.T) {
 	if err := os.Symlink(target, filepath.Join(volume, "main", "snapshot-restore-proxy")); err != nil {
 		t.Fatal(err)
 	}
-	dir, err := openPodControlDir(podsDir, "uid", "main")
+	dir, err := openPodControlDir(nodeRoot, "uid", "main")
 	if err != nil {
 		t.Fatalf("openPodControlDir: %v", err)
 	}
