@@ -70,22 +70,29 @@ func openContainerControlDir(procRoot string, hostPID int) (*os.File, error) {
 	return os.NewFile(uintptr(fd), filepath.Join(rootPath, rel)), nil
 }
 
-// KubeletPodsDir is kubelet's per-Pod directory, seen through the node's root
-// filesystem: the agent runs with hostPID, so /host/proc/1 is the node's init.
-// Unlike a hostPath mount it is not rewritten by vCluster, and it sees
-// emptyDirs that kubelet mounts after the agent started, such as
+// NodeRootPath is the node's root filesystem: the agent runs with hostPID, so
+// /host/proc/1 is the node's init. Kubelet's per-Pod directory is read through
+// it rather than through a hostPath mount, which vCluster rewrites and which
+// does not see emptyDirs kubelet mounts after the agent started, such as
 // medium: Memory.
-const KubeletPodsDir = HostProcPath + "/1/root/var/lib/kubelet/pods"
+const NodeRootPath = HostProcPath + "/1/root"
 
-// podControlVolumeDir is the Pod's snapshot-control emptyDir under podsDir. It
-// also checks containerName, which callers open inside it.
-func podControlVolumeDir(podsDir, podUID, containerName string) (string, error) {
+// kubeletPodsDir is kubelet's per-Pod directory, relative to the node's root.
+// It is resolved inside that root (RESOLVE_IN_ROOT), never joined onto it as a
+// path: on nodes where /var/lib/kubelet is an absolute symlink - to
+// /mnt/nvme/kubelet, say - the kernel would otherwise resolve the target
+// against the agent's own root, where it does not exist.
+const kubeletPodsDir = "var/lib/kubelet/pods"
+
+// podControlVolumeDir is the Pod's snapshot-control emptyDir, relative to the
+// node's root. It also checks containerName, which callers open inside it.
+func podControlVolumeDir(podUID, containerName string) (string, error) {
 	for _, part := range []string{podUID, containerName} {
 		if part == "" || part != filepath.Base(part) || part == ".." {
 			return "", fmt.Errorf("invalid control directory part %q", part)
 		}
 	}
-	return filepath.Join(podsDir, podUID, "volumes", "kubernetes.io~empty-dir",
+	return filepath.Join(kubeletPodsDir, podUID, "volumes", "kubernetes.io~empty-dir",
 		podcontract.SnapshotControlVolumeName), nil
 }
 
@@ -99,20 +106,30 @@ func podControlVolumeDir(podsDir, podUID, containerName string) (string, error) 
 // changed by the Pod. So the container's directory is opened without
 // following symlinks, and files are created relative to it, never by path.
 func OpenPodControlDir(podUID, containerName string) (*os.File, error) {
-	return openPodControlDir(KubeletPodsDir, podUID, containerName)
+	return openPodControlDir(NodeRootPath, podUID, containerName)
 }
 
-func openPodControlDir(podsDir, podUID, containerName string) (*os.File, error) {
-	volumePath, err := podControlVolumeDir(podsDir, podUID, containerName)
+func openPodControlDir(nodeRoot, podUID, containerName string) (*os.File, error) {
+	rel, err := podControlVolumeDir(podUID, containerName)
 	if err != nil {
 		return nil, err
 	}
-	volume, err := os.OpenFile(volumePath, os.O_RDONLY|unix.O_DIRECTORY, 0)
+	volumePath := filepath.Join(nodeRoot, rel)
+	rootFD, err := unix.Open(nodeRoot, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open node root %s: %w", nodeRoot, err)
 	}
-	defer volume.Close()
-	vfd := int(volume.Fd())
+	defer unix.Close(rootFD)
+	// Symlinks kubelet's own directories may be, such as /var/lib/kubelet
+	// itself, resolve as they do on the node; nothing resolves outside it.
+	vfd, err := unix.Openat2(rootFD, rel, &unix.OpenHow{
+		Flags:   unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC,
+		Resolve: unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_MAGICLINKS,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", volumePath, err)
+	}
+	defer unix.Close(vfd)
 	if err := unix.Mkdirat(vfd, containerName, 0o755); err != nil && !errors.Is(err, unix.EEXIST) {
 		return nil, fmt.Errorf("create control directory %s/%s: %w", volumePath, containerName, err)
 	}
